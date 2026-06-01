@@ -60,7 +60,10 @@ class TrainPipeline:
     def build_parser() -> argparse.ArgumentParser:
         p = argparse.ArgumentParser(description="train diffusion model")
         p.add_argument("--config", default=None, help="YAML config 경로 (생략 시 configs/vv_default.yaml)")
-        p.add_argument("--gpu", type=int, default=0)
+        p.add_argument("--gpu", type=int, default=0, help="단일 GPU index (기본)")
+        p.add_argument("--gpus", type=int, nargs="+", default=None,
+                       help="여러 GPU 지정 시 nn.DataParallel (예: --gpus 0 1, 최대 2장). "
+                            "생략 시 --gpu 한 장만 사용.")
         p.add_argument("--ratio_arch", default="identity")
         p.add_argument("--ratio_ckpt", default=None,
                        help="online_cs mode 일 때 필요. cache_cs 면 무시.")
@@ -95,8 +98,25 @@ class TrainPipeline:
         torch.manual_seed(cfg.seed)
         np.random.seed(cfg.seed)
 
-        device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
-        self.logger.info(f"device = {device}")
+        # ── device / GPU 선택 (기본 단일, --gpus 지정 시 DataParallel) ──
+        use_cuda = torch.cuda.is_available()
+        if use_cuda and args.gpus:
+            n_dev = torch.cuda.device_count()
+            gpu_ids = [g for g in args.gpus if 0 <= g < n_dev]
+            if len(gpu_ids) != len(args.gpus):
+                self.logger.warning(f"존재하지 않는 GPU id 무시 (가용 {n_dev}장): "
+                                    f"{sorted(set(args.gpus) - set(gpu_ids))}")
+            if len(gpu_ids) > 2:
+                self.logger.warning(f"DataParallel 최대 2장 권장 — 앞 2개만 사용: {gpu_ids[:2]}")
+                gpu_ids = gpu_ids[:2]
+            if not gpu_ids:
+                gpu_ids = [args.gpu]
+        else:
+            gpu_ids = [args.gpu] if use_cuda else []
+        device = f"cuda:{gpu_ids[0]}" if use_cuda else "cpu"
+        multi_gpu = len(gpu_ids) > 1
+        self.logger.info(f"device = {device}"
+                         + (f"  +DataParallel{gpu_ids}" if multi_gpu else ""))
 
         # ── dataset ───────────────────────────────────────────────────
         ratio_model = None
@@ -122,23 +142,26 @@ class TrainPipeline:
         self.logger.info(f"dataset: train={len(train_ds)} val={len(val_ds)}")
 
         # ── model + schedule + opt ────────────────────────────────────
-        model = self._build_model(cfg, cfg.data.patch_size).to(device)
+        # core_model: 원본 (EMA / state_dict / 저장·로드 용 — module. prefix 없음)
+        # model:      forward 용 (multi-GPU 면 DataParallel 래핑)
+        core_model = self._build_model(cfg, cfg.data.patch_size).to(device)
+        model = torch.nn.DataParallel(core_model, device_ids=gpu_ids) if multi_gpu else core_model
         schedule = make_linear_schedule(
             T=cfg.diffusion.T,
             beta_start=cfg.diffusion.beta_start,
             beta_end=cfg.diffusion.beta_end,
             device=device,
         )
-        opt = torch.optim.Adam(model.parameters(), lr=cfg.train.lr)
-        ema = EMA(model, decay=cfg.train.ema_decay)
-        n_params = sum(p.numel() for p in model.parameters())
+        opt = torch.optim.Adam(core_model.parameters(), lr=cfg.train.lr)
+        ema = EMA(core_model, decay=cfg.train.ema_decay)
+        n_params = sum(p.numel() for p in core_model.parameters())
         self.logger.info(f"model params: {n_params/1e6:.2f} M")
 
         # ── resume ────────────────────────────────────────────────────
         start_iter = 0
         if args.resume is not None:
             ck = torch.load(args.resume, map_location=device)
-            model.load_state_dict(ck["model"])
+            core_model.load_state_dict(ck["model"])
             opt.load_state_dict(ck["opt"])
             ema.shadow = {k: v.to(device) for k, v in ck["ema"].items()}
             start_iter = ck.get("iter", 0)
@@ -174,7 +197,7 @@ class TrainPipeline:
             if ((it + 1) % accum) == 0:
                 opt.step()
                 opt.zero_grad(set_to_none=True)
-                ema.update(model)
+                ema.update(core_model)
 
             pbar.update(1)
 
@@ -192,19 +215,19 @@ class TrainPipeline:
                 vloss = self._val_loss(model, schedule, val_loader, device)
                 tb.add_scalar("val/loss", vloss, it + 1)
                 val_hist.append((it + 1, vloss))
-                self._validate(model, ema, schedule, val_loader, cfg, device, out_dir, it + 1, tb)
+                self._validate(core_model, ema, schedule, val_loader, cfg, device, out_dir, it + 1, tb)
                 self._plot_loss_curve(out_dir, train_hist, val_hist)
                 tqdm.write(f"[{cfg.exp_name}] iter {it+1}  val_loss={vloss:.4f}  "
                            f"→ loss_curve.png 갱신")
 
             if (it + 1) % cfg.train.ckpt_every == 0:
-                self._save_ckpt(out_dir, model, ema, opt, it + 1, tag="last")
+                self._save_ckpt(out_dir, core_model, ema, opt, it + 1, tag="last")
                 tqdm.write(f"[{cfg.exp_name}] iter {it+1}  ckpt saved")
 
             it += 1
 
         pbar.close()
-        self._save_ckpt(out_dir, model, ema, opt, it, tag="last")
+        self._save_ckpt(out_dir, core_model, ema, opt, it, tag="last")
         tb.close()
         self.logger.info(f"training done. out_dir={out_dir}")
 
