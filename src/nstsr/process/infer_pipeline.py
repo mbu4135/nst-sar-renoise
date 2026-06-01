@@ -16,8 +16,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from tqdm import tqdm
+
 from nstsr.config.config import load_config
 from nstsr.config.norm_config import denormalize_image, normalize_image
+from nstsr.data.ratio_builder import _patch_offsets
 from nstsr.data.transforms import from_log10, to_log10
 from nstsr.diffusion.sampler import sample as dips_sample
 from nstsr.diffusion.schedule import make_linear_schedule
@@ -47,6 +50,11 @@ class InferPipeline:
         p.add_argument("--eta", type=float, default=0.0)
         p.add_argument("--gpu", type=int, default=0)
         p.add_argument("--seed", type=int, default=None)
+        # ── overlap-tile (큰 영상을 학습 패치 크기로 잘라 추론 후 합침) ──
+        p.add_argument("--tile", type=int, default=None,
+                       help="타일 크기. 기본=cfg.data.patch_size(학습 패치). 영상이 더 크면 자동 타일링")
+        p.add_argument("--tile_stride", type=int, default=None, help="타일 stride (기본 tile//2)")
+        p.add_argument("--tile_batch", type=int, default=16, help="한 번에 추론할 타일 수")
         return p
 
     # ── .npy/.tif/.img 공용 I/O (.img 는 --img_shape 필요) ──────────────
@@ -64,6 +72,40 @@ class InferPipeline:
             save_raw_bef32(path, arr)
         else:
             save_image(path, arr)
+
+    # ── 샘플링: 작은 영상은 통째로, 큰 영상은 타일링 후 Hanning 합성 ──────
+    @torch.no_grad()
+    def _sample_whole(self, model, schedule, s_norm, cs_norm, device, args):
+        s_t  = torch.from_numpy(np.ascontiguousarray(s_norm)).float()[None, None].to(device)
+        cs_t = torch.from_numpy(np.ascontiguousarray(cs_norm)).float()[None, None].to(device)
+        x0 = dips_sample(model, schedule, s_t, cs_t, shape=s_t.shape, device=device,
+                         S=args.steps, t_last=args.t_last, r=args.r, eta=args.eta)
+        return x0.squeeze().detach().cpu().numpy()
+
+    @torch.no_grad()
+    def _sample_tiled(self, model, schedule, s_norm, cs_norm, device, tile, stride, batch, args):
+        """학습 패치 크기(tile)로 잘라 타일별 추론 → Hanning overlap-tile 합성 (norm 도메인)."""
+        H, W = s_norm.shape
+        ys = _patch_offsets(H, tile, stride)
+        xs = _patch_offsets(W, tile, stride)
+        coords = [(y0, x0) for y0 in ys for x0 in xs]
+        hann = np.outer(np.hanning(tile), np.hanning(tile)).astype(np.float64)
+        accum = np.zeros((H, W), dtype=np.float64)
+        wsum  = np.zeros((H, W), dtype=np.float64)
+        for i in tqdm(range(0, len(coords), batch), desc="tiles", unit="batch"):
+            chunk = coords[i:i + batch]
+            sb = np.stack([s_norm[y:y + tile, x:x + tile] for (y, x) in chunk])
+            cb = np.stack([cs_norm[y:y + tile, x:x + tile] for (y, x) in chunk])
+            s_t  = torch.from_numpy(sb).float().unsqueeze(1).to(device)
+            cs_t = torch.from_numpy(cb).float().unsqueeze(1).to(device)
+            x0 = dips_sample(model, schedule, s_t, cs_t, shape=s_t.shape, device=device,
+                             S=args.steps, t_last=args.t_last, r=args.r, eta=args.eta)
+            x0 = x0[:, 0].detach().cpu().numpy()
+            for j, (y, x) in enumerate(chunk):
+                accum[y:y + tile, x:x + tile] += x0[j] * hann
+                wsum[y:y + tile, x:x + tile]  += hann
+        wsum = np.where(wsum == 0, 1.0, wsum)
+        return (accum / wsum).astype(np.float32)
 
     # ─────────────────────────────────────────────────────────────────
     def _load_model(self, cfg, ckpt_path: str, device: str, input_resolution: int) -> UNet:
@@ -90,43 +132,40 @@ class InferPipeline:
         cfg = load_config(args.config)
         device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
 
-        # ── load s, build cs ──────────────────────────────────────────
+        # ── load s, build cs (norm 도메인 [H, W] numpy) ───────────────
         shape = tuple(args.img_shape) if args.img_shape else None
         s_lin = self._load_img(args.s, shape)
-        s_log = to_log10(s_lin)
-        s_norm = normalize_image(s_log, pol=args.pol)
-        s_t = torch.from_numpy(np.ascontiguousarray(s_norm)).float().unsqueeze(0).unsqueeze(0).to(device)
-
+        s_norm = normalize_image(to_log10(s_lin), pol=args.pol).astype(np.float32)
+        H, W = s_norm.shape
         if args.cs is None:
-            cs_t = torch.full_like(s_t, 0.5)
+            cs_norm = np.full((H, W), 0.5, dtype=np.float32)
             self.logger.info("cs not provided — using constant 0.5 (no-change scenario)")
         else:
-            cs_arr = self._load_img(args.cs, shape)
-            cs_t = torch.from_numpy(np.ascontiguousarray(cs_arr)).float().unsqueeze(0).unsqueeze(0).to(device)
+            cs_norm = self._load_img(args.cs, shape).astype(np.float32)
+            if cs_norm.shape != s_norm.shape:
+                raise ValueError(f"s shape {s_norm.shape} != cs shape {cs_norm.shape}")
 
-        if s_t.shape != cs_t.shape:
-            raise ValueError(f"s shape {s_t.shape} != cs shape {cs_t.shape}")
-
-        # ── model ─────────────────────────────────────────────────────
-        H, W = s_t.shape[-2:]
-        model = self._load_model(cfg, args.ckpt, device, input_resolution=min(H, W))
+        # ── model (input_resolution = 타일 크기 = 학습 패치) ───────────
+        tile = int(args.tile) if args.tile else int(cfg.data.patch_size)
+        tile = min(tile, H, W)
+        model = self._load_model(cfg, args.ckpt, device, input_resolution=tile)
         schedule = make_linear_schedule(
             T=cfg.diffusion.T, beta_start=cfg.diffusion.beta_start,
             beta_end=cfg.diffusion.beta_end, device=device,
         )
 
-        # ── sample ────────────────────────────────────────────────────
-        self.logger.info(f"sampling: shape={tuple(s_t.shape)} steps={args.steps}")
-        x0_norm = dips_sample(
-            model, schedule, s_t, cs_t, shape=s_t.shape, device=device,
-            S=args.steps, t_last=args.t_last, r=args.r, eta=args.eta,
-        )
+        # ── sample: 영상이 타일보다 크면 overlap-tile, 아니면 통째로 ──
+        if H <= tile and W <= tile:
+            self.logger.info(f"whole-image sampling: shape=({H},{W}) steps={args.steps}")
+            x0_norm = self._sample_whole(model, schedule, s_norm, cs_norm, device, args)
+        else:
+            stride = int(args.tile_stride) if args.tile_stride else max(1, tile // 2)
+            self.logger.info(f"tiled sampling: ({H},{W}) tile={tile} stride={stride} "
+                             f"batch={args.tile_batch} steps={args.steps}")
+            x0_norm = self._sample_tiled(model, schedule, s_norm, cs_norm, device,
+                                         tile, stride, args.tile_batch, args)
 
         # ── log-norm → linear ─────────────────────────────────────────
-        x0_norm_np = x0_norm.squeeze().detach().cpu().numpy()
-        y_log = denormalize_image(x0_norm_np, pol=args.pol)
-        y_lin = from_log10(y_log)
-        y_lin = np.clip(y_lin, 0.0, None)  # 음수 방지
-
+        y_lin = np.clip(from_log10(denormalize_image(x0_norm, pol=args.pol)), 0.0, None)
         self._save_img(args.out, y_lin)
         self.logger.info(f"saved: {args.out}  shape={y_lin.shape}  mean={y_lin.mean():.4g}  std={y_lin.std():.4g}")
