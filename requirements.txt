@@ -1,0 +1,6 @@
+torch>=2.0
+numpy>=1.23
+pyyaml>=6.0
+tifffile>=2023.7.10
+matplotlib>=3.5
+tensorboard>=2.10

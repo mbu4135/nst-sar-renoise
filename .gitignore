@@ -1,0 +1,27 @@
+# ── 기본: 전부 무시 (최상위 항목) ──
+/*
+
+# ── 공유할 코드/문서만 다시 포함 ──
+!/.gitignore
+!/src/
+!/configs/
+!/scripts/
+!/SAR_RNSD_SPEC.md
+!/requirements.txt
+!/README.md
+
+# ── 공유 디렉토리 내부에서도 생성물/대용량/바이너리는 절대 추적 안 함 ──
+**/__pycache__/
+*.pyc
+*.pyo
+*.npy
+*.pt
+*.pth
+*.img
+*.rmli
+*.tif
+*.tiff
+*.bmp
+*.png
+*.csv
+*.gz

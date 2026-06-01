@@ -1,0 +1,45 @@
+exp_name: vv_rnsd_baseline
+seed: 42
+pol: vv
+
+data:
+  root: ./data_root            # prepare 파이프라인 결과 경로
+  patch_size: 128
+  batch_size: 16
+  num_workers: 4
+  augment: true
+  mode: cache_cs               # cache_cs | online_cs
+
+model:
+  base_ch: 64
+  ch_mults: [1, 2, 4, 8]
+  num_res_blocks: 2
+  attn_resolutions: [16]
+  in_ch: 1
+  out_ch: 1
+  use_mcam: true
+  use_tccam: false             # 현 단계 비활성, 추후 편파 확장 시 true
+
+diffusion:
+  T: 1000
+  beta_start: 1.0e-4
+  beta_end: 2.0e-2
+  schedule: linear
+  loss: l2
+
+train:
+  lr: 8.0e-5
+  optimizer: adam
+  grad_accum_steps: 2
+  total_iters: 200000
+  ema_decay: 0.995
+  log_every: 100
+  val_every: 2000
+  ckpt_every: 5000
+
+sampling:
+  method: dips_basic
+  steps: 30
+  t_last: 4
+  r: 10.0
+  eta: 0.0
