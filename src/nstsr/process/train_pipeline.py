@@ -227,11 +227,28 @@ class TrainPipeline:
             S=cfg.sampling.steps, t_last=cfg.sampling.t_last,
             r=cfg.sampling.r, eta=cfg.sampling.eta,
         )
-        # 시각화 (log-norm 도메인)
+        # 시각화 stretch — 학습용 norm 은 극단값까지 담느라 널널해서 그냥 보면 대비가 약함.
+        # 시각화 전용으로 percentile stretch 를 한 번 더 건다.
+        #  · clean(s) 의 분포로 vmin/vmax 를 잡아 s·y·sample(=noise-free + noisy) 에 "동일" 적용
+        #    → 같은 스케일이라 노이즈 유무를 직접 비교 가능.
+        #  · cs(ratio) 는 의미가 다르므로 자체 stretch.
+        def _stretch(t, lo=2.0, hi=98.0):
+            a = t.detach().cpu().numpy() if hasattr(t, "detach") else np.asarray(t)
+            vmn, vmx = np.percentile(a, [lo, hi])
+            if vmx <= vmn:
+                vmx = vmn + 1e-6
+            return float(vmn), float(vmx)
+
+        s_img, y_img, cs_img = batch["s"][0], batch["y"][0], batch["cs"][0]
+        samp = x0_norm[0].cpu()
+        v_int = _stretch(s_img)        # clean 기준 공유 stretch (noise-free + noisy 동일)
+        v_cs  = _stretch(cs_img)
         save_grid_png(
             out_dir / "val" / f"step_{step:07d}.png",
-            [batch["s"][0], batch["y"][0], batch["cs"][0], x0_norm[0].cpu()],
-            titles=["s (clean)", "y (gt noisy)", "cs (ratio)", "sample"],
+            [s_img, y_img, cs_img, samp],
+            titles=[f"s (clean)\nstretch[{v_int[0]:.2f},{v_int[1]:.2f}]",
+                    "y (gt noisy)", f"cs (ratio)\n[{v_cs[0]:.2f},{v_cs[1]:.2f}]", "sample"],
+            vranges=[v_int, v_int, v_cs, v_int],   # s·y·sample 동일 / cs 별도
         )
         # linear domain mean / std 도 함께 로깅
         y_log_pred = denormalize_image(x0_norm.cpu().numpy(), pol=cfg.pol)

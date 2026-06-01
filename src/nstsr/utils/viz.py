@@ -8,9 +8,12 @@ from pathlib import Path
 import numpy as np
 
 
-def save_grid_png(path: str | Path, images: list, titles: list | None = None, vmin: float = 0.0, vmax: float = 1.0):
+def save_grid_png(path: str | Path, images: list, titles: list | None = None,
+                  vmin: float = 0.0, vmax: float = 1.0, vranges: list | None = None):
     """
-    images : list of 2D np.ndarray (또는 [1,H,W] torch tensor) — log-normalized 가정.
+    images  : list of 2D np.ndarray (또는 [1,H,W] torch tensor) — log-normalized 가정.
+    vranges : 패널별 (vmin, vmax) 리스트. 주면 패널마다 다른 stretch 적용
+              (None 이면 전역 vmin/vmax). 시각화 stretch 용.
     """
     try:
         import matplotlib
@@ -28,7 +31,8 @@ def save_grid_png(path: str | Path, images: list, titles: list | None = None, vm
             img = img.detach().cpu().numpy()
         if img.ndim == 3:
             img = img[0]
-        axes[i].imshow(img, cmap="gray", vmin=vmin, vmax=vmax)
+        vlo, vhi = (vranges[i] if vranges is not None else (vmin, vmax))
+        axes[i].imshow(img, cmap="gray", vmin=vlo, vmax=vhi)
         axes[i].set_axis_off()
         if titles is not None:
             axes[i].set_title(titles[i])
