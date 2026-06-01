@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from nstsr.config.config import exp_dir, load_config
 from nstsr.data.dataset import SARTripletDataset
@@ -153,6 +154,8 @@ class TrainPipeline:
         running_loss = 0.0
         t0 = time.time()
         loader_iter = iter(train_loader)
+        pbar = tqdm(total=cfg.train.total_iters, initial=start_iter,
+                    desc=cfg.exp_name, dynamic_ncols=True, unit="it")
 
         while it < cfg.train.total_iters:
             try:
@@ -170,10 +173,13 @@ class TrainPipeline:
                 opt.zero_grad(set_to_none=True)
                 ema.update(model)
 
+            pbar.update(1)
+
             if (it + 1) % cfg.train.log_every == 0:
                 avg = running_loss / cfg.train.log_every
                 dt  = time.time() - t0
-                self.logger.info(f"iter {it+1:>7d}  loss={avg:.4f}  ({cfg.train.log_every/dt:.1f} it/s)")
+                rate = cfg.train.log_every / dt if dt > 0 else 0.0
+                pbar.set_postfix(loss=f"{avg:.4f}", it_s=f"{rate:.1f}")
                 tb.add_scalar("train/loss", avg, it + 1)
                 running_loss = 0.0
                 t0 = time.time()
@@ -183,9 +189,11 @@ class TrainPipeline:
 
             if (it + 1) % cfg.train.ckpt_every == 0:
                 self._save_ckpt(out_dir, model, ema, opt, it + 1, tag="last")
+                tqdm.write(f"[{cfg.exp_name}] iter {it+1}  ckpt saved")
 
             it += 1
 
+        pbar.close()
         self._save_ckpt(out_dir, model, ema, opt, it, tag="last")
         tb.close()
         self.logger.info(f"training done. out_dir={out_dir}")
