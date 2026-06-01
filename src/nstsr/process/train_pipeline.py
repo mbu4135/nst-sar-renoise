@@ -255,12 +255,15 @@ class TrainPipeline:
         #  · clean(s) 의 분포로 vmin/vmax 를 잡아 s·y·sample(=noise-free + noisy) 에 "동일" 적용
         #    → 같은 스케일이라 노이즈 유무를 직접 비교 가능.
         #  · cs(ratio) 는 의미가 다르므로 자체 stretch.
-        def _stretch(t, lo=2.0, hi=98.0):
+        def _stretch(t, lo=1.0, hi=99.0, widen=0.6):
+            # percentile 로 범위를 잡되, widen 만큼 양쪽으로 더 넓혀 대비를 완화한다.
+            # (clean s 의 분포가 좁아 그대로 쓰면 흑백 saturate 가 심함 → 범위 확장)
             a = t.detach().cpu().numpy() if hasattr(t, "detach") else np.asarray(t)
             vmn, vmx = np.percentile(a, [lo, hi])
             if vmx <= vmn:
                 vmx = vmn + 1e-6
-            return float(vmn), float(vmx)
+            m = (vmx - vmn) * widen
+            return float(vmn - m), float(vmx + m)
 
         s_img, y_img, cs_img = batch["s"][0], batch["y"][0], batch["cs"][0]
         samp = x0_norm[0].cpu()
