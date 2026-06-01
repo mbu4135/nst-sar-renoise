@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -154,6 +155,8 @@ class TrainPipeline:
         running_loss = 0.0
         t0 = time.time()
         loader_iter = iter(train_loader)
+        train_hist: list[tuple[int, float]] = []   # (step, train_loss)
+        val_hist:   list[tuple[int, float]] = []    # (step, val_loss)
         pbar = tqdm(total=cfg.train.total_iters, initial=start_iter,
                     desc=cfg.exp_name, dynamic_ncols=True, unit="it")
 
@@ -181,11 +184,18 @@ class TrainPipeline:
                 rate = cfg.train.log_every / dt if dt > 0 else 0.0
                 pbar.set_postfix(loss=f"{avg:.4f}", it_s=f"{rate:.1f}")
                 tb.add_scalar("train/loss", avg, it + 1)
+                train_hist.append((it + 1, avg))
                 running_loss = 0.0
                 t0 = time.time()
 
             if (it + 1) % cfg.train.val_every == 0:
+                vloss = self._val_loss(model, schedule, val_loader, device)
+                tb.add_scalar("val/loss", vloss, it + 1)
+                val_hist.append((it + 1, vloss))
                 self._validate(model, ema, schedule, val_loader, cfg, device, out_dir, it + 1, tb)
+                self._plot_loss_curve(out_dir, train_hist, val_hist)
+                tqdm.write(f"[{cfg.exp_name}] iter {it+1}  val_loss={vloss:.4f}  "
+                           f"→ loss_curve.png 갱신")
 
             if (it + 1) % cfg.train.ckpt_every == 0:
                 self._save_ckpt(out_dir, model, ema, opt, it + 1, tag="last")
@@ -229,6 +239,58 @@ class TrainPipeline:
         tb.add_scalar("val/pred_mean_linear", float(y_lin_pred.mean()), step)
         tb.add_scalar("val/pred_std_linear",  float(y_lin_pred.std()), step)
         self.logger.info(f"  val @ step {step}: pred mean={y_lin_pred.mean():.4g} std={y_lin_pred.std():.4g}")
+
+    # ─────────────────────────────────────────────────────────────────
+    @torch.no_grad()
+    def _val_loss(self, model, schedule, val_loader, device, max_batches: int = 64) -> float:
+        """Held-out ε-MSE (training loss 와 동일 정의). 고정 seed 로 (t, ε) 를 뽑아
+        eval 간 비교 가능한 안정적 곡선을 만든다. EMA 가 아닌 학습 weight 로 평가."""
+        if len(val_loader) == 0:
+            return float("nan")
+        was_training = model.training
+        model.eval()
+        g = torch.Generator().manual_seed(1234)   # CPU generator, 고정
+        total, n = 0.0, 0
+        for i, batch in enumerate(val_loader):
+            if i >= max_batches:
+                break
+            y  = batch["y"].to(device)
+            s  = batch["s"].to(device)
+            cs = batch["cs"].to(device)
+            B = y.size(0)
+            t   = torch.randint(0, schedule.T, (B,), generator=g).to(device)
+            eps = torch.randn(y.shape, generator=g).to(device)
+            sqrt_ab   = schedule.sqrt_alpha_bar[t].view(-1, 1, 1, 1)
+            sqrt_1_ab = schedule.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1, 1)
+            x_t = sqrt_ab * y + sqrt_1_ab * eps
+            total += F.mse_loss(model(x_t, t, s, cs), eps).item()
+            n += 1
+        if was_training:
+            model.train()
+        return total / max(n, 1)
+
+    # ─────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _plot_loss_curve(out_dir: Path, train_hist, val_hist) -> None:
+        """매 eval 마다 train/val loss 곡선을 loss_curve.png 로 덮어쓴다."""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(7, 4))
+        if train_hist:
+            ts, ls = zip(*train_hist)
+            ax.plot(ts, ls, color="tab:blue", alpha=0.5, lw=1, label="train")
+        if val_hist:
+            vs, vl = zip(*val_hist)
+            ax.plot(vs, vl, color="tab:red", marker="o", ms=3, label="val")
+        ax.set_xlabel("iter")
+        ax.set_ylabel("ε-MSE loss")
+        ax.set_yscale("log")
+        ax.grid(alpha=0.3, which="both")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(out_dir / "loss_curve.png", dpi=110)
+        plt.close(fig)
 
     # ─────────────────────────────────────────────────────────────────
     def _save_ckpt(self, out_dir: Path, model, ema, opt, it: int, tag: str = "last") -> None:
