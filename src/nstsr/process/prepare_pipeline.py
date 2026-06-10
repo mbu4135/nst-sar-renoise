@@ -1,13 +1,17 @@
 """
 PreparePipeline — raw (y, s) → (y, s, cs) triple 을 디스크에 저장하고 split 파일 생성.
 
+cs 는 기본 multilook 모드: linear ratio = y/s 를 looks×looks 블록평균(고전 multilook)
+→ log10 → symmetric min-max(`norm_config.ratio_ml`, vv L=0.6) 로 만들어 patch/looks
+해상도(예 512/16=32)로 저장. 학습 denoiser 불필요. (--cs_mode denoiser 로 구 경로 선택)
+
 CLI:
     python main.py prepare \
         --y_dir /USER/single_look_vv \
         --s_dir /USER/temporal_avg_vv \
-        --ratio_ckpt /USER/ratio_denoiser_vv.pth \
         --out_dir ./data_root \
-        --pol vv
+        --pol vv --channel C11 --img_shape 3680 12960 \
+        --patch 512 --patch_stride 256 --cs_mode multilook --looks 16
 """
 from __future__ import annotations
 
@@ -20,7 +24,8 @@ from typing import List, Tuple
 import numpy as np
 
 from nstsr.data.ratio_builder import (
-    build_ratio_cs_numpy, build_ratio_cs_patched_numpy, _patch_offsets,
+    build_ratio_cs_numpy, build_ratio_cs_patched_numpy,
+    build_ratio_cs_multilook_numpy, _patch_offsets,
 )
 from nstsr.model.ratio_denoiser import build_ratio_denoiser
 from nstsr.utils.io import load_image, load_raw_bef32, save_npy
@@ -40,6 +45,9 @@ class PreparePipeline:
         p.add_argument("--y_dir", required=True, help="single-look (y) 영상 디렉토리")
         p.add_argument("--s_dir", required=True, help="temporal-averaged (s) 영상 디렉토리")
         p.add_argument("--out_dir", required=True, help="data_root (출력 디렉토리)")
+        p.add_argument("--cs_mode", default="multilook", choices=["multilook", "denoiser"],
+                       help="cs 생성 방식 (기본 multilook): multilook(고전 looks×looks 평균, 모델 불필요, cs=patch/looks 해상도) | denoiser(학습된 ratio 모델, cs=patch 해상도)")
+        p.add_argument("--looks", type=int, default=16, help="multilook 모드 블록 크기 (cs 해상도 = patch/looks)")
         p.add_argument("--ratio_arch", default="identity", help="ratio denoiser arch (예: i2i_unetsar)")
         p.add_argument("--ratio_ckpt", default=None, help="pretrained ratio denoiser 체크포인트")
         p.add_argument("--ratio_base_ch", type=int, default=32, help="i2i_unetsar UNet 폭")
@@ -145,10 +153,16 @@ class PreparePipeline:
         splits_dir = out_dir / "splits"
         splits_dir.mkdir(parents=True, exist_ok=True)
 
-        ratio_model = build_ratio_denoiser(
-            arch=args.ratio_arch, ckpt_path=args.ratio_ckpt,
-            device=args.device, base_ch=args.ratio_base_ch,
-        )
+        multilook = args.cs_mode == "multilook"
+        if multilook:
+            ratio_model = None
+            self.logger.info(f"cs_mode=multilook (looks={args.looks}) — denoiser 미사용, "
+                             f"cs 해상도 = patch/{args.looks}")
+        else:
+            ratio_model = build_ratio_denoiser(
+                arch=args.ratio_arch, ckpt_path=args.ratio_ckpt,
+                device=args.device, base_ch=args.ratio_base_ch,
+            )
 
         img_mode = args.img_shape is not None
         if img_mode:
@@ -199,7 +213,11 @@ class PreparePipeline:
             if y.shape != s.shape:
                 self.logger.warning(f"shape mismatch for {sid}: y={y.shape} s={s.shape} — skip")
                 continue
-            if img_mode:
+            if multilook:
+                # patch 모드는 patch 별로 계산(아래). full-scene 모드만 여기서 계산.
+                cs = None if patch_mode else build_ratio_cs_multilook_numpy(
+                    y, s, looks=args.looks, eps=args.eps, pol=args.pol)
+            elif img_mode:
                 cs = build_ratio_cs_patched_numpy(
                     y, s, ratio_denoiser=ratio_model,
                     patch_size=args.ratio_patch, stride=args.ratio_stride,
@@ -210,9 +228,17 @@ class PreparePipeline:
                                           eps=args.eps, pol=args.pol, device=args.device)
 
             if patch_mode:
-                # 한 날짜의 모든 land patch 를 (N, P, P) 로 묶어 저장
+                # 한 날짜의 모든 land patch 를 묶어 저장. y 는 (N, P, P);
+                # cs 는 denoiser면 (N, P, P), multilook 이면 (N, P/looks, P/looks).
                 y_stack = np.stack([y[y0:y0 + P, x0:x0 + P] for (y0, x0) in coords]).astype(np.float32)
-                cs_stack = np.stack([cs[y0:y0 + P, x0:x0 + P] for (y0, x0) in coords]).astype(np.float32)
+                if multilook:
+                    cs_stack = np.stack([
+                        build_ratio_cs_multilook_numpy(
+                            y[y0:y0 + P, x0:x0 + P], s[y0:y0 + P, x0:x0 + P],
+                            looks=args.looks, eps=args.eps, pol=args.pol)
+                        for (y0, x0) in coords]).astype(np.float32)
+                else:
+                    cs_stack = np.stack([cs[y0:y0 + P, x0:x0 + P] for (y0, x0) in coords]).astype(np.float32)
                 save_npy(out_dir / "y_patches" / f"{sid}.npy", y_stack)
                 save_npy(out_dir / "cs_patches" / f"{sid}.npy", cs_stack)
                 if not s_saved:  # s 는 모든 날짜 공통 → 1회만

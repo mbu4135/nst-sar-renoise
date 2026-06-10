@@ -50,6 +50,13 @@ NORM_CONFIG = {
             "mode": "minmax_symmetric",
             "log_abs_max": 2.5,
         },
+        # multilook (16x16) ratio — speckle 256-look 평균 후 log spread 가 ±0.5 안으로
+        # 좁아져 single-look L=2.5 는 과대. data_root land patch 실측(99.9pctl|log|=0.48,
+        # clip@0.6=0.033%)으로 L=0.6 확정 → cs 가 norm[0,1] 을 제대로 채움.
+        "ratio_ml": {
+            "mode": "minmax_symmetric",
+            "log_abs_max": 0.6,
+        },
     },
     # VH intensity ratio (= C22.img)
     "vh": {
@@ -62,6 +69,12 @@ NORM_CONFIG = {
             "mode": "minmax_symmetric",
             "log_abs_max": 2.9,
         },
+        # provisional (single-look L × vv 비율 0.24). 실제 C22 ML 데이터로
+        # dataset-distribution-check 후 확정할 것.
+        "ratio_ml": {
+            "mode": "minmax_symmetric",
+            "log_abs_max": 0.7,
+        },
     },
     # cross-pol magnitude ratio (= C12_mag.img)
     "cross": {
@@ -73,6 +86,12 @@ NORM_CONFIG = {
         "ratio": {
             "mode": "minmax_symmetric",
             "log_abs_max": 1.5,
+        },
+        # provisional (single-look L × vv 비율 0.24). 실제 C12_mag ML 데이터로
+        # dataset-distribution-check 후 확정할 것.
+        "ratio_ml": {
+            "mode": "minmax_symmetric",
+            "log_abs_max": 0.4,
         },
     },
 }
@@ -117,15 +136,16 @@ def from_log_ratio(x_log):
 
 # ── ratio (minmax_symmetric) ───────────────────────────────────────────────
 
-def _ratio_L(pol: str) -> float:
-    cfg = NORM_CONFIG[pol]["ratio"]
+def _ratio_L(pol: str, ml: bool = False) -> float:
+    """ratio normalization L. ml=True → multilook(ratio_ml) L (좁은 범위)."""
+    cfg = NORM_CONFIG[pol]["ratio_ml" if ml else "ratio"]
     assert cfg["mode"] == "minmax_symmetric"
     return float(cfg["log_abs_max"])
 
 
-def normalize_ratio(x_log, pol: str = "vv", clip: bool = True):
-    """log10 ratio → [0, 1] (0.5 = no change)."""
-    L = _ratio_L(pol)
+def normalize_ratio(x_log, pol: str = "vv", clip: bool = True, ml: bool = False):
+    """log10 ratio → [0, 1] (0.5 = no change). ml=True → multilook 전용 L 사용."""
+    L = _ratio_L(pol, ml=ml)
     y = (x_log + L) / (2.0 * L)
     if clip:
         if _is_torch(y):
@@ -135,9 +155,9 @@ def normalize_ratio(x_log, pol: str = "vv", clip: bool = True):
     return y
 
 
-def denormalize_ratio(x_norm, pol: str = "vv"):
-    """[0, 1] norm → log10 ratio."""
-    L = _ratio_L(pol)
+def denormalize_ratio(x_norm, pol: str = "vv", ml: bool = False):
+    """[0, 1] norm → log10 ratio. ml=True → multilook 전용 L 사용."""
+    L = _ratio_L(pol, ml=ml)
     return x_norm * (2.0 * L) - L
 
 

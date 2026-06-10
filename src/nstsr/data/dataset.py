@@ -6,7 +6,9 @@ SARTripletDataset — (y, s, cs) triple 을 log-normalized [0, 1] 도메인에�
 (1) stacked (live, prepare --patch 출력) — 한 날짜의 land patch 를 묶어 저장:
     <root>/
         y_patches/<date>.npy     # (N, P, P) linear single-look
-        cs_patches/<date>.npy    # (N, P, P) [0,1] denoised ratio
+        cs_patches/<date>.npy    # [0,1] normalized ratio. 기본 multilook: (N, P/looks, P/looks)
+                                 #   저해상 그대로 사용(upsample 없음) — augment 가 ratio 배수 offset 으로
+                                 #   정렬 crop, 모델 cs_enc 가 bottleneck 해상도로 resize. denoiser 모드면 (N, P, P).
         s_patches.npy            # (N, P, P) linear temporal-avg (모든 날짜 공통, 1개)
         coords.csv               # patch_idx, y0, x0, ...
         splits/{train,val}.txt   # "date:idx" per line
@@ -30,7 +32,7 @@ from nstsr.config.norm_config import normalize_image
 from nstsr.data.ratio_builder import build_ratio_cs
 from nstsr.data.transforms import (
     augment_triplet,
-    center_crop,
+    center_crop_triplet,
     to_log10,
     to_tensor_2d,
 )
@@ -123,6 +125,9 @@ class SARTripletDataset(Dataset):
             date, k = self.samples[idx]
             y = self._norm_from_linear(self._mmap(self._y_cache, "y_patches", date)[k])
             s = self._norm_from_linear(self._s[k])
+            # multilook cs 는 patch/looks 해상도(저해상) 그대로 사용. upsample 없이
+            # augment/center crop 에서 ratio 배수 offset 으로 정렬 crop, 모델 내부
+            # cs_enc 가 bottleneck 해상도로 resize. (MCAM cs 를 bottleneck 에 1회 주입)
             cs = to_tensor_2d(np.array(self._mmap(self._cs_cache, "cs_patches", date)[k],
                                        dtype=np.float32))  # copy: mmap 은 read-only
             sid = f"{date}:{k}"
@@ -145,6 +150,6 @@ class SARTripletDataset(Dataset):
         if self.augment:
             y, s, cs = augment_triplet(y, s, cs, patch=self.patch_size)
         else:
-            y, s, cs = center_crop((y, s, cs), self.patch_size)
+            y, s, cs = center_crop_triplet(y, s, cs, self.patch_size)
 
         return {"y": y, "s": s, "cs": cs, "scene_id": sid}

@@ -1,13 +1,12 @@
 """
 MCAM-SAR — Multi-scale Content-Aware Module (s, cs 동시 주입).
 
-원 RNSD 의 MCAM 은 `s` 한 image 만 받지만 본 모델은 `s` 와 `cs`
-**두 image** 를 받는다. 가중치를 **공유하지 않는** 두 인코더로 다중 스케일 feature 를 산출한다.
-
-Encoder 는 3 단계 다운샘플링 (입력 해상도 포함 → 3개 스케일 feature).
-UNet decoder 의 각 upsampling stage 에서
-    concat([upsampled, skip_i, F_s[i], F_cs[i]])
-형태로 주입된다.
+원 RNSD 의 MCAM 은 `s` 한 image 만 받는다. 본 모델은 `s` 와 `cs` 를 받되 **역할이 다르다**:
+- `s` (full-res clean): MCAMEncoder 로 3 스케일 feature → UNet decoder up-path 각 stage 에
+  concat([upsampled, skip_i, F_s[i]]) 형태로 주입.
+- `cs` (저해상 16x multilook, coarse 조건): CSEncoder 로 native 저해상에서 conv 후
+  bottleneck 해상도로 resize → UNet middle 에서 1회 concat. (cs 는 fine 정보가 없어
+  full-res conv/upsample 이 낭비라 저해상 그대로 처리.)
 """
 from __future__ import annotations
 
@@ -68,22 +67,49 @@ class MCAMEncoder(nn.Module):
         return [f0, f1, f2]
 
 
+class CSEncoder(nn.Module):
+    """저해상 cs(16x multilook) 전용 인코더 — bottleneck 1회 주입용.
+
+    cs 는 y/s 보다 looks 배 coarse(예: 128 patch → 8x8)라 fine 스케일 정보가 없다.
+    그래서 다운샘플 없이 native 해상도에서 conv 만 돌린 뒤(=full-res conv 낭비 제거),
+    forward 시점에 bottleneck 해상도(target_hw)로 nearest resize 해서 한 번만 주입한다.
+    cs 입력 해상도는 임의여도 됨(학습 crop·추론 타일 모두 target_hw 로 맞춰짐).
+
+    Returns: [B, out_ch, *target_hw].
+    """
+
+    def __init__(self, in_ch: int = 1, out_ch: int = 256):
+        super().__init__()
+        self.net = _conv_block(in_ch, out_ch)
+        self.out_ch = out_ch
+
+    def forward(self, cs: torch.Tensor, target_hw) -> torch.Tensor:
+        f = self.net(cs)
+        if f.shape[-2:] != tuple(target_hw):
+            f = F.interpolate(f, size=tuple(target_hw), mode="nearest")
+        return f
+
+
 class MCAM(nn.Module):
     """
-    s, cs 각각 독립적인 (non-shared) encoder 로 multi-scale feature 추출.
+    s 는 multi-scale(non-shared) 인코더로 up-path 3 스케일 주입,
+    cs 는 저해상 전용 CSEncoder 로 bottleneck 1회 주입.
 
     forward:
-        s, cs : [B, 1, H, W]
-        return: (F_s, F_cs) — 각 list of 3 tensors.
+        s  : [B, 1, H, W]      → F_s (list of 3, scales [1, 1/2, 1/4])
+        cs : [B, 1, Hc, Wc]    (저해상) + target_hw → cs_feat [B, cs_ch, *target_hw]
     """
 
-    def __init__(self, in_ch: int = 1, base_ch: int = 64, ch_mults: Sequence[int] = (1, 2, 4)):
+    def __init__(self, in_ch: int = 1, base_ch: int = 64, ch_mults: Sequence[int] = (1, 2, 4),
+                 cs_ch: int | None = None):
         super().__init__()
         self.enc_s  = MCAMEncoder(in_ch=in_ch, base_ch=base_ch, ch_mults=ch_mults)
-        self.enc_cs = MCAMEncoder(in_ch=in_ch, base_ch=base_ch, ch_mults=ch_mults)
-        self.out_channels = self.enc_s.out_channels  # tuple (c0, c1, c2)
+        self.out_channels = self.enc_s.out_channels  # tuple (c0, c1, c2) — F_s 용
+        self.cs_ch = cs_ch if cs_ch is not None else base_ch * ch_mults[-1]
+        self.enc_cs = CSEncoder(in_ch=in_ch, out_ch=self.cs_ch)
 
-    def forward(self, s: torch.Tensor, cs: torch.Tensor):
-        F_s  = self.enc_s(s)
-        F_cs = self.enc_cs(cs)
-        return F_s, F_cs
+    def encode_s(self, s: torch.Tensor):
+        return self.enc_s(s)
+
+    def encode_cs(self, cs: torch.Tensor, target_hw) -> torch.Tensor:
+        return self.enc_cs(cs, target_hw)

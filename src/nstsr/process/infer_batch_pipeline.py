@@ -44,8 +44,15 @@ def _overlap_tile_infer(
     r: float,
     eta: float,
 ) -> np.ndarray:
-    """log-normalized 입력 → log-normalized 출력. overlap-tile + Hanning blending."""
+    """log-normalized 입력 → log-normalized 출력. overlap-tile + Hanning blending.
+
+    cs_norm 은 s_norm 보다 저해상(multilook)일 수 있어 타일별로 비율에 맞춰 자른다
+    (모델 cs_enc 가 bottleneck 으로 resize 하므로 정확한 크기는 무관).
+    """
     H, W = s_norm.shape
+    ch, cw = cs_norm.shape
+    cty = max(1, round(patch * ch / H))
+    ctx = max(1, round(patch * cw / W))
     stride = patch - overlap
     if stride <= 0:
         raise ValueError(f"overlap ({overlap}) must be smaller than patch ({patch})")
@@ -64,7 +71,9 @@ def _overlap_tile_infer(
     for y0 in ys:
         for x0 in xs:
             s_tile  = s_norm [y0:y0+patch, x0:x0+patch]
-            cs_tile = cs_norm[y0:y0+patch, x0:x0+patch]
+            cy0 = min(int(round(y0 * ch / H)), ch - cty)
+            cx0 = min(int(round(x0 * cw / W)), cw - ctx)
+            cs_tile = cs_norm[cy0:cy0+cty, cx0:cx0+ctx]
             s_t  = torch.from_numpy(np.ascontiguousarray(s_tile)).float().unsqueeze(0).unsqueeze(0).to(device)
             cs_t = torch.from_numpy(np.ascontiguousarray(cs_tile)).float().unsqueeze(0).unsqueeze(0).to(device)
             x0_norm = dips_sample(
@@ -144,9 +153,11 @@ class InferBatchPipeline:
                 if not cp.exists():
                     self.logger.warning(f"no cs match for {sp.name} — skipping")
                     continue
-                cs_norm = load_image(cp).astype(np.float32)
+                cs_norm = load_image(cp).astype(np.float32)   # 저해상/ full-res 모두 허용
             else:
-                cs_norm = np.full_like(s_norm, 0.5)
+                # 무변화: 저해상 상수 0.5 (full-res cs_enc conv 낭비 회피)
+                H0, W0 = s_norm.shape
+                cs_norm = np.full((max(1, H0 // 16), max(1, W0 // 16)), 0.5, dtype=np.float32)
 
             x0_norm = _overlap_tile_infer(
                 model, schedule, s_norm, cs_norm,

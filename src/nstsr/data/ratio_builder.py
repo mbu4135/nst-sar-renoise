@@ -76,6 +76,49 @@ def build_ratio_cs_numpy(
     return cs.squeeze().detach().cpu().numpy()
 
 
+def build_ratio_cs_multilook_numpy(
+    y_linear: np.ndarray,
+    s_linear: np.ndarray,
+    looks: int = 16,
+    eps: float = 1e-8,
+    pol: str = "vv",
+) -> np.ndarray:
+    """denoiser 없이 고전적 multilook 으로 cs 생성.
+
+    linear ratio = y/s 를 비중첩 looks×looks 블록 평균(= multilook) → log10 →
+    multilook 전용 L(ratio_ml)로 symmetric min-max 정규화.
+
+    1. raw = y / (s + eps)                       (linear, 변화 없음 ≈ 1)
+    2. ocean(y==0 | s==0) 픽셀은 평균에서 제외 (masked block mean)
+    3. looks×looks 블록 평균 → 해상도 1/looks 로 축소
+    4. norm = normalize_ratio(log10(blk + eps), ml=True)   ([0,1], 무변화 0.5)
+    5. 완전 ocean 블록 → 0 (기존 cs[~mask]=0 convention 과 일치)
+
+    Returns cs : [H//looks, W//looks] float32 in [0, 1].
+    """
+    y = np.asarray(y_linear, dtype=np.float32)
+    s = np.asarray(s_linear, dtype=np.float32)
+    assert y.shape == s.shape and y.ndim == 2, f"expect 2D same-shape, got {y.shape}/{s.shape}"
+    H, W = y.shape
+    b = int(looks)
+    Hb, Wb = H // b, W // b
+    if Hb < 1 or Wb < 1:
+        raise ValueError(f"image {H}x{W} too small for {b}x{b} multilook")
+
+    mask = ((y > 0) & (s > 0)).astype(np.float32)
+    raw = (y / (s + eps)) * mask                       # ocean → 0, 평균에서 제외
+    raw = raw[:Hb * b, :Wb * b].reshape(Hb, b, Wb, b)
+    msk = mask[:Hb * b, :Wb * b].reshape(Hb, b, Wb, b)
+    num = raw.sum(axis=(1, 3))
+    den = msk.sum(axis=(1, 3))                          # 블록당 valid look 수
+    valid = den > 0
+    blk = np.where(valid, num / np.where(valid, den, 1.0), 0.0).astype(np.float32)
+
+    norm = normalize_ratio(np.log10(blk + eps), pol=pol, ml=True).astype(np.float32)
+    norm[~valid] = 0.0
+    return norm
+
+
 def _patch_offsets(total: int, patch: int, stride: int):
     offs = list(range(0, total - patch + 1, stride))
     if not offs or offs[-1] != total - patch:

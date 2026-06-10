@@ -3,10 +3,11 @@ MCAM-SAR 가 통합된 conditional UNet for diffusion.
 
 Inputs
 ------
-x_t : [B, 1, H, W]   noisy single-look SAR (log-normalized).
-t   : [B]            timestep (long).
-s   : [B, 1, H, W]   clean (temporal-averaged) SAR  (log-normalized).
-cs  : [B, 1, H, W]   denoised ratio image          ([0, 1], 변화 없음 = 0.5).
+x_t : [B, 1, H, W]    noisy single-look SAR (log-normalized).
+t   : [B]             timestep (long).
+s   : [B, 1, H, W]    clean (temporal-averaged) SAR  (log-normalized).
+cs  : [B, 1, Hc, Wc]  ratio image ([0,1], 변화 없음 = 0.5). **저해상 가능**
+                      (16x multilook → H/16). 어떤 해상도여도 내부에서 bottleneck 으로 resize.
 
 Output
 ------
@@ -16,12 +17,16 @@ Structure (ch_mults = [1, 2, 4, 8]):
                    level 0           level 1           level 2           level 3 (bottom)
     encoder    in→64 ──down──→ 128 ──down──→ 256 ──down──→ 512
                   │              │              │              │
-                 skip0          skip1          skip2         middle
-                  │              │              │              │
-    MCAM(s,cs)   F0[64]         F1[128]        F2[256]
-                  │              │              │              │
+                 skip0          skip1          skip2         middle ◄─ concat cs_feat
+                  │              │              │                       (CSEncoder(cs)→resize)
+    enc_s(s)     F0[64]         F1[128]        F2[256]
+                  │              │              │
     decoder   ←─up─ 64  ←──up── 128  ←──up── 256  ←──up── 512
-                       (concat [up, skip, F_s, F_cs] at each level i ∈ {0,1,2})
+                       (concat [up, skip, F_s] at level i ∈ {0,1,2})
+
+cs 는 coarse(16x multilook) 조건이라 fine 스케일 정보가 없으므로 up-path 3 스케일이 아니라
+bottleneck 에 1회만 주입한다(CSEncoder 가 native 저해상에서 conv → bottleneck 해상도로 resize).
+decoder 가 그 영향을 full-res 로 자연 전파. → cs full-res conv/upsample 낭비 제거.
 """
 from __future__ import annotations
 
@@ -147,13 +152,16 @@ class UNet(nn.Module):
         # ── time embedding ─────────────────────────────────────────────
         self.time_emb = TimeEmbedding(dim=t_emb_dim, hidden=t_hidden)
 
-        # ── mcam (s, cs) — 첫 3 level 만 ────────────────────────────────
+        # ── mcam: s 는 up-path 3 스케일, cs 는 bottleneck 1회 주입 ──────────
         if use_mcam:
             self.mcam = MCAM(in_ch=1, base_ch=base_ch, ch_mults=ch_mults[:3])
-            mcam_chs = self.mcam.out_channels  # (c0, c1, c2)
+            mcam_chs = self.mcam.out_channels  # (c0, c1, c2) — F_s 용
+            cs_ch = self.mcam.cs_ch            # bottleneck 에 concat 될 cs feature 채널
         else:
             self.mcam = None
             mcam_chs = (0, 0, 0)
+            cs_ch = 0
+        self.cs_ch = cs_ch
 
         # ── input projection ───────────────────────────────────────────
         self.in_conv = nn.Conv2d(in_ch, base_ch, kernel_size=3, padding=1)
@@ -178,20 +186,21 @@ class UNet(nn.Module):
                 cur_res //= 2
             self.down_resolutions.append(cur_res)
 
-        # ── middle ─────────────────────────────────────────────────────
-        self.mid_block1 = ResBlock(cur_ch, cur_ch, t_hidden)
+        # ── middle (cs feature 를 bottleneck 에서 concat) ───────────────
+        self.mid_block1 = ResBlock(cur_ch + cs_ch, cur_ch, t_hidden)
         self.mid_attn   = SelfAttention2d(cur_ch) if cur_res in self.attn_resolutions else nn.Identity()
         self.mid_block2 = ResBlock(cur_ch, cur_ch, t_hidden)
 
         # ── decoder ────────────────────────────────────────────────────
-        # 각 level (top-down 순) 에서 MCAM features 가 더해질 채널 수:
-        #   level 0,1,2 → 2 * mcam_chs[level]   (F_s + F_cs)
+        # 각 level (top-down 순) 에서 up-path 에 concat 될 MCAM feature 채널 수:
+        #   level 0,1,2 → mcam_chs[level]   (F_s 만; cs 는 bottleneck 에서 별도 주입)
         #   level 3 (bottom) → 0
         self.up_blocks = nn.ModuleList()
         self.up_specs: List[dict] = []  # 각 entry: 어떤 작업인지 메타
         for level in reversed(range(len(ch_mults))):
             out_c = base_ch * ch_mults[level]
-            mcam_c = (2 * mcam_chs[level]) if (use_mcam and level < 3) else 0
+            # up-path 에는 F_s 만 (cs 는 bottleneck 에서 별도 주입)
+            mcam_c = mcam_chs[level] if (use_mcam and level < 3) else 0
             for i in range(num_res_blocks + 1):
                 skip_c = skip_channels.pop()
                 self.up_blocks.append(ResBlock(cur_ch + skip_c + mcam_c, out_c, t_hidden))
@@ -230,9 +239,9 @@ class UNet(nn.Module):
         """
         if self.use_mcam:
             assert s is not None and cs is not None, "MCAM 활성 시 s, cs 가 필요"
-            F_s, F_cs = self.mcam(s, cs)   # 각 list[3]
+            F_s = self.mcam.encode_s(s)    # list[3] — up-path 주입 (cs 는 bottleneck 에서)
         else:
-            F_s = F_cs = [None, None, None]
+            F_s = [None, None, None]
 
         t_emb = self.time_emb(t)
 
@@ -251,7 +260,10 @@ class UNet(nn.Module):
             else:
                 raise RuntimeError(f"unexpected block {type(block)}")
 
-        # ── middle ───────────────────────────────────────────────────
+        # ── middle (cs 를 bottleneck 해상도로 resize 해 concat 주입) ─────
+        if self.use_mcam:
+            cs_feat = self.mcam.encode_cs(cs, h.shape[-2:])  # [B, cs_ch, *bottleneck]
+            h = torch.cat([h, cs_feat], dim=1)
         h = self.mid_block1(h, t_emb)
         h = self.mid_attn(h) if not isinstance(self.mid_attn, nn.Identity) else h
         h = self.mid_block2(h, t_emb)
@@ -263,8 +275,7 @@ class UNet(nn.Module):
                 skip = skips.pop()
                 cond_extra = []
                 if spec["mcam_c"] > 0:
-                    level = spec["level"]
-                    cond_extra = [F_s[level], F_cs[level]]
+                    cond_extra = [F_s[spec["level"]]]
                 h_in = torch.cat([h, skip] + cond_extra, dim=1)
                 h = block(h_in, t_emb)
             elif kind == "attn":
