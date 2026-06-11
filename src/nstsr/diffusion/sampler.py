@@ -36,8 +36,7 @@ def dips_basic_schedule(T: int = 1000, S: int = 30, t_last: int = 4, r: float = 
 def sample(
     model,
     schedule: DDPMSchedule,
-    s: torch.Tensor,
-    cs: torch.Tensor,
+    cond: torch.Tensor,
     shape: tuple | None = None,
     device: str = "cuda",
     S: int = 30,
@@ -47,14 +46,14 @@ def sample(
     clamp_x0: bool = True,
 ) -> torch.Tensor:
     """
-    DDIM-style deterministic sampling (eta=0).
+    DDIM-style sampling (eta>0 면 stochastic — speckle 텍스처 위해 권장).
 
-    s, cs : [B, 1, H, W] conditioning (log-normalized).
-    shape : 출력 텐서 shape. 기본은 s.shape.
-    return: x_0 (log-normalized [0, 1] approx).
+    cond  : [B, C, H, W] conditioning (μ, D_A, shadow) concat.
+    shape : 생성할 r 의 shape (B,1,H,W). 기본은 cond 로부터.
+    return: x_0 = 생성된 normalized r (∈ [-1,1] 근처). 추론에서 ŷ=μ·10**denormalize_r(r̂).
     """
     if shape is None:
-        shape = tuple(s.shape)
+        shape = (cond.shape[0], 1, cond.shape[2], cond.shape[3])
     model.eval()
     schedule = schedule.to(device)
 
@@ -65,14 +64,14 @@ def sample(
         t      = ts[i]
         t_next = ts[i + 1]
         t_tensor = torch.full((shape[0],), t, device=device, dtype=torch.long)
-        eps_hat  = model(x_t, t_tensor, s, cs)
+        eps_hat  = model(x_t, t_tensor, cond)
 
         ab_t    = schedule.alpha_bar[t]
         ab_next = schedule.alpha_bar[t_next] if t_next > 0 else torch.tensor(1.0, device=device)
 
         x0_pred = (x_t - torch.sqrt(1.0 - ab_t) * eps_hat) / torch.sqrt(ab_t)
         if clamp_x0:
-            x0_pred = x0_pred.clamp(0.0, 1.0)
+            x0_pred = x0_pred.clamp(-1.0, 1.0)
 
         if eta == 0.0:
             dir_xt = torch.sqrt(1.0 - ab_next) * eps_hat

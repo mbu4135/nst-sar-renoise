@@ -28,11 +28,14 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from nstsr.config.norm_config import normalize_image
+from nstsr.config.norm_config import (
+    normalize_image, normalize_r, normalize_mu_intensity, normalize_da,
+)
 from nstsr.data.ratio_builder import build_ratio_cs
 from nstsr.data.transforms import (
     augment_triplet,
     center_crop_triplet,
+    random_crop, center_crop, random_hflip, random_vflip,
     to_log10,
     to_tensor_2d,
 )
@@ -153,3 +156,80 @@ class SARTripletDataset(Dataset):
             y, s, cs = center_crop_triplet(y, s, cs, self.patch_size)
 
         return {"y": y, "s": s, "cs": cs, "scene_id": sid}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# renoise speckle 설계 (현행)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SARSpeckleDataset(Dataset):
+    """
+    speckle_ds 로더. target r = log10(y_t/μ) (=speckle), conditioning = (μ, D_A, valid).
+
+    sample id = "date:k"  (k = 그 날짜 r_patches 내 로컬 인덱스).
+    layout (build_speckle_ds.py 출력):
+        <root>/
+            mu_patches.npy, da_patches.npy, valid_patches.npy   # (N, P, P) 공유 — coords idx 로 매핑
+            r_patches/<date>.npy        # (Nk, P, P) raw log10(y/μ)  (정규화는 여기서)
+            cmask_patches/<date>.npy    # (Nk, P, P) uint8 loss mask (shadow/change/no-data=0)
+            idx_patches/<date>.npy      # (Nk,) 공유 cond 의 coords idx
+            splits/{train,val}.txt      # "date:k" per line
+
+    반환 (모두 [C, h, w] tensor, augment 후 patch_size):
+        r     : [1, h, w]  normalize_r(log10 ratio) ∈ [-1, 1]   (diffusion x0/target)
+        cond  : [3, h, w]  [μ_norm, D_A_norm, valid]            (model conditioning)
+        cmask : [1, h, w]  loss mask ∈ {0, 1}
+    """
+
+    def __init__(self, root, split: str = "train", patch_size: int = 128, augment: bool = True):
+        super().__init__()
+        self.root = Path(root)
+        self.patch_size = patch_size
+        self.augment = augment
+
+        split_file = self.root / "splits" / f"{split}.txt"
+        with open(split_file) as f:
+            ids = [ln.strip() for ln in f if ln.strip()]
+        if not ids:
+            raise RuntimeError(f"empty split: {split_file}")
+        self.samples = [(s.split(":")[0], int(s.split(":")[1])) for s in ids]
+
+        self._mu = np.load(self.root / "mu_patches.npy", mmap_mode="r")
+        self._da = np.load(self.root / "da_patches.npy", mmap_mode="r")
+        self._val = np.load(self.root / "valid_patches.npy", mmap_mode="r")
+        self._r_cache: dict[str, np.ndarray] = {}
+        self._cm_cache: dict[str, np.ndarray] = {}
+        self._idx_cache: dict[str, np.ndarray] = {}
+
+    def _mmap(self, cache: dict, sub: str, date: str) -> np.ndarray:
+        if date not in cache:
+            cache[date] = np.load(self.root / sub / f"{date}.npy", mmap_mode="r")
+        return cache[date]
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        date, k = self.samples[idx]
+        r_raw = np.array(self._mmap(self._r_cache, "r_patches", date)[k], dtype=np.float32)
+        cm = np.array(self._mmap(self._cm_cache, "cmask_patches", date)[k], dtype=np.float32)
+        gidx = int(self._mmap(self._idx_cache, "idx_patches", date)[k])
+        mu = np.asarray(self._mu[gidx], dtype=np.float32)
+        da = np.asarray(self._da[gidx], dtype=np.float32)
+        val = np.asarray(self._val[gidx], dtype=np.float32)
+
+        r = to_tensor_2d(normalize_r(r_raw))                 # [1,P,P] ∈ [-1,1]
+        mu_n = to_tensor_2d(normalize_mu_intensity(mu))      # [1,P,P]
+        da_n = to_tensor_2d(normalize_da(da))                # [1,P,P]
+        valt = to_tensor_2d(val)                             # [1,P,P]
+        cmask = to_tensor_2d(cm)                             # [1,P,P]
+        cond = torch.cat([mu_n, da_n, valt], dim=0)          # [3,P,P]
+
+        if self.augment:
+            r, cond, cmask = random_crop((r, cond, cmask), self.patch_size)
+            r, cond, cmask = random_hflip((r, cond, cmask))
+            r, cond, cmask = random_vflip((r, cond, cmask))
+        else:
+            r, cond, cmask = center_crop((r, cond, cmask), self.patch_size)
+
+        return {"r": r, "cond": cond, "cmask": cmask, "scene_id": f"{date}:{k}"}

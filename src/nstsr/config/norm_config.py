@@ -197,6 +197,47 @@ def denormalize_image(x_norm, pol: str = "vv"):
     raise NotImplementedError(f"unknown image norm mode: {cfg['mode']}")
 
 
+# ── renoise speckle 설계 (r=log10(y/μ) target, μ·D_A 입력) ───────────────────
+# speckle_ds(korea VV 30date) 실분포로 확정 (build_speckle_ds.py 출력 측정).
+#   μ log10 ∈ ~[-2.3,+0.2], D_A bulk ~[1,2]·99%=2.0, |r| 99.5%=2.46·std 0.60.
+NORM_SPECKLE = {
+    "r_absmax":   2.5,    # target r: r_norm = clip(r / L, -1, 1)  (0 = 무변동, clip~0.5%)
+    "mu_log_min": -2.5,   # μ(intensity): (log10 μ - min)/(max-min) → [0,1]
+    "mu_log_max":  1.0,
+    "da_max":      3.0,   # D_A = 1/MSR: clip(D_A, 0, da_max)/da_max → [0,1]
+    "eps":        1e-8,
+}
+
+
+def normalize_r(r, clip: bool = True):
+    """log10 ratio target r → [-1, 1] (0 = 무변동). 모델 학습 타깃 도메인."""
+    L = NORM_SPECKLE["r_absmax"]
+    y = r / L
+    if clip:
+        y = torch.clamp(y, -1.0, 1.0) if _is_torch(y) else np.clip(y, -1.0, 1.0)
+    return y
+
+
+def denormalize_r(r_norm):
+    """[-1, 1] norm → log10 ratio. 추론에서 ŷ = μ · 10**denormalize_r(r̂)."""
+    return r_norm * NORM_SPECKLE["r_absmax"]
+
+
+def normalize_mu_intensity(mu_linear):
+    """μ (linear intensity) → log10 → [0,1] (conditioning 입력)."""
+    lo, hi, eps = NORM_SPECKLE["mu_log_min"], NORM_SPECKLE["mu_log_max"], NORM_SPECKLE["eps"]
+    lg = torch.log10(mu_linear + eps) if _is_torch(mu_linear) else np.log10(mu_linear + eps)
+    y = (lg - lo) / (hi - lo)
+    return torch.clamp(y, 0.0, 1.0) if _is_torch(y) else np.clip(y, 0.0, 1.0)
+
+
+def normalize_da(da):
+    """D_A (=1/MSR) → [0,1] (conditioning 입력). 큰 D_A = distributed/불안정."""
+    m = NORM_SPECKLE["da_max"]
+    y = da / m
+    return torch.clamp(y, 0.0, 1.0) if _is_torch(y) else np.clip(y, 0.0, 1.0)
+
+
 if __name__ == "__main__":
     print("=== ratio normalization (minmax_symmetric, 0.5 = no change) ===")
     for pol, cfg in NORM_CONFIG.items():

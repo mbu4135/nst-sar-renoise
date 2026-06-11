@@ -1,12 +1,17 @@
 """
-InferPipeline — 단일 clean s 영상 → synthetic single-look noisy 영상.
+InferPipeline — renoise speckle 합성.
 
-CLI:
-    python main.py infer \
-        --ckpt checkpoints/vv_rnsd_baseline/ema.pt \
-        --s    sample_clean_vv.tif \
-        --out  sample_synth_noisy_vv.tif \
-        --pol  vv --steps 30
+조건 (대상 장면의 시간통계 + 기하; 모두 같은 격자):
+    --mu      temporal mean intensity (μ, linear)         [필수]
+    --da      amplitude dispersion D_A = 1/MSR             [옵션, 없으면 1.0 상수]
+    --shadow  valid mask (1=정상, 0=shadow/no-data)        [옵션, 없으면 all-valid]
+
+모델은 r = log10(y/μ) (speckle) 를 cond=[μ_n, D_A_n, valid] 조건으로 생성하고,
+출력은 ŷ = μ · 10**r̂ (single-look noisy intensity). shadow/no-data 픽셀은 0.
+
+큰 영상은 학습 패치 크기로 overlap-tile 후 Hanning 합성 (r 도메인). eta>0 권장(speckle 텍스처).
+
+I/O: .img(big-endian float32, --img_shape 필요) / .npy / .tif.
 """
 from __future__ import annotations
 
@@ -15,15 +20,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
-
 from tqdm import tqdm
 
 from nstsr.config.config import load_config
-from nstsr.config.norm_config import denormalize_image, normalize_image, normalize_ratio
-from nstsr.data.ratio_builder import (
-    _patch_offsets, build_ratio_cs_patched_numpy, build_ratio_cs_multilook_numpy,
+from nstsr.config.norm_config import (
+    normalize_mu_intensity, normalize_da, denormalize_r,
 )
-from nstsr.data.transforms import from_log10, to_log10
+from nstsr.data.ratio_builder import _patch_offsets
 from nstsr.diffusion.sampler import sample as dips_sample
 from nstsr.diffusion.schedule import make_linear_schedule
 from nstsr.model.unet import UNet
@@ -37,39 +40,26 @@ class InferPipeline:
 
     @staticmethod
     def build_parser() -> argparse.ArgumentParser:
-        p = argparse.ArgumentParser(description="infer single image")
+        p = argparse.ArgumentParser(description="renoise speckle 합성 (μ,D_A,shadow → noisy ŷ)")
         p.add_argument("--ckpt", required=True, help="ema.pt or last.pt")
-        p.add_argument("--s", required=True, help="clean (s) 영상 경로 (linear .npy/.tif/.img)")
-        p.add_argument("--cs", default=None,
-                       help="(옵션) **이미 정규화된** [0,1] cs 영상 (0.5=무변화). 생략 시 0.5 상수")
-        p.add_argument("--cs_raw", default=None,
-                       help="(옵션) **linear ratio** 영상 → 내부에서 cs 생성. --cs 와 배타")
-        p.add_argument("--cs_mode", default="multilook", choices=["multilook", "denoiser"],
-                       help="--cs_raw cs 생성 방식 (기본 multilook, 학습 데이터와 동일): "
-                            "multilook(looks×looks 평균 + ml-norm + nearest 업샘플) | denoiser(학습된 ratio 모델, --ratio_ckpt 필요)")
-        p.add_argument("--looks", type=int, default=16, help="multilook 모드 블록 크기 (학습과 동일하게)")
-        p.add_argument("--ratio_ckpt", default=None,
-                       help="(옵션) --cs_mode denoiser 일 때 i2i_unetsar ratio 모델 체크포인트 (legacy)")
-        p.add_argument("--ratio_base_ch", type=int, default=32, help="ratio 모델 UNet 폭 (i2i_ratio_C11_ft=32)")
-        p.add_argument("--out", required=True, help="출력 노이지 영상 경로 (.npy/.tif/.img)")
+        p.add_argument("--mu", required=True, help="temporal mean intensity μ (linear .npy/.tif/.img)")
+        p.add_argument("--da", default=None, help="(옵션) D_A=1/MSR map. 생략 시 1.0 상수")
+        p.add_argument("--shadow", default=None, help="(옵션) valid mask(1=정상). 생략 시 all-valid")
+        p.add_argument("--out", required=True, help="출력 noisy intensity ŷ (.npy/.tif/.img)")
         p.add_argument("--img_shape", type=int, nargs=2, default=None, metavar=("H", "W"),
-                       help=".img(raw big-endian float32) 입출력 시 영상 크기 (예: --img_shape 3680 12960)")
+                       help=".img I/O 시 영상 크기 (예: --img_shape 13124 68647)")
         p.add_argument("--config", default=None)
-        p.add_argument("--pol", default="vv")
         p.add_argument("--steps", type=int, default=30)
-        p.add_argument("--t_last", type=int, default=4)
+        p.add_argument("--t_last", type=int, default=1)
         p.add_argument("--r", type=float, default=10.0)
-        p.add_argument("--eta", type=float, default=0.0)
+        p.add_argument("--eta", type=float, default=1.0, help="stochastic 샘플링(speckle 텍스처). 0=deterministic")
         p.add_argument("--gpu", type=int, default=0)
         p.add_argument("--seed", type=int, default=None)
-        # ── overlap-tile (큰 영상을 학습 패치 크기로 잘라 추론 후 합침) ──
-        p.add_argument("--tile", type=int, default=None,
-                       help="타일 크기. 기본=cfg.data.patch_size(학습 패치). 영상이 더 크면 자동 타일링")
+        p.add_argument("--tile", type=int, default=None, help="타일 크기. 기본=cfg.data.patch_size")
         p.add_argument("--tile_stride", type=int, default=None, help="타일 stride (기본 tile//2)")
-        p.add_argument("--tile_batch", type=int, default=16, help="한 번에 추론할 타일 수")
+        p.add_argument("--tile_batch", type=int, default=16)
         return p
 
-    # ── .npy/.tif/.img 공용 I/O (.img 는 --img_shape 필요) ──────────────
     @staticmethod
     def _load_img(path, shape):
         if str(path).lower().endswith(".img"):
@@ -85,64 +75,44 @@ class InferPipeline:
         else:
             save_image(path, arr)
 
-    # ── 샘플링: 작은 영상은 통째로, 큰 영상은 타일링 후 Hanning 합성 ──────
+    # ── 샘플링: cond(3ch) → r̂(log10 ratio). 큰 영상은 overlap-tile ─────────
     @torch.no_grad()
-    def _sample_whole(self, model, schedule, s_norm, cs_norm, device, args):
-        s_t  = torch.from_numpy(np.ascontiguousarray(s_norm)).float()[None, None].to(device)
-        cs_t = torch.from_numpy(np.ascontiguousarray(cs_norm)).float()[None, None].to(device)
-        x0 = dips_sample(model, schedule, s_t, cs_t, shape=s_t.shape, device=device,
-                         S=args.steps, t_last=args.t_last, r=args.r, eta=args.eta)
-        return x0.squeeze().detach().cpu().numpy()
+    def _sample_r(self, model, schedule, cond, device, tile, stride, batch, args):
+        """cond: [3, H, W] numpy → r̂ [H, W] (log10 ratio, denormalized)."""
+        _, H, W = cond.shape
+        if H <= tile and W <= tile:
+            ct = torch.from_numpy(np.ascontiguousarray(cond)).float()[None].to(device)
+            r0 = dips_sample(model, schedule, ct, shape=(1, 1, H, W), device=device,
+                             S=args.steps, t_last=args.t_last, r=args.r, eta=args.eta)
+            return denormalize_r(r0[0, 0].cpu().numpy())
 
-    @torch.no_grad()
-    def _sample_tiled(self, model, schedule, s_norm, cs_norm, device, tile, stride, batch, args):
-        """학습 패치 크기(tile)로 잘라 타일별 추론 → Hanning overlap-tile 합성 (norm 도메인).
-
-        cs_norm 은 s_norm 보다 저해상(multilook)일 수 있어, 각 타일의 cs 를 비율에 맞춰
-        잘라 넣는다(모델 cs_enc 가 bottleneck 으로 resize 하므로 정확한 크기는 무관).
-        """
-        H, W = s_norm.shape
-        ch, cw = cs_norm.shape
-        cty = max(1, round(tile * ch / H))   # cs 타일 크기 (고정 → batch stack 가능)
-        ctx = max(1, round(tile * cw / W))
         ys = _patch_offsets(H, tile, stride)
         xs = _patch_offsets(W, tile, stride)
         coords = [(y0, x0) for y0 in ys for x0 in xs]
         hann = np.outer(np.hanning(tile), np.hanning(tile)).astype(np.float64)
-        accum = np.zeros((H, W), dtype=np.float64)
-        wsum  = np.zeros((H, W), dtype=np.float64)
+        accum = np.zeros((H, W), np.float64)
+        wsum = np.zeros((H, W), np.float64)
         for i in tqdm(range(0, len(coords), batch), desc="tiles", unit="batch"):
             chunk = coords[i:i + batch]
-            sb = np.stack([s_norm[y:y + tile, x:x + tile] for (y, x) in chunk])
-            cb_list = []
-            for (y, x) in chunk:
-                cy = min(int(round(y * ch / H)), ch - cty)
-                cx = min(int(round(x * cw / W)), cw - ctx)
-                cb_list.append(cs_norm[cy:cy + cty, cx:cx + ctx])
-            cb = np.stack(cb_list)
-            s_t  = torch.from_numpy(sb).float().unsqueeze(1).to(device)
-            cs_t = torch.from_numpy(cb).float().unsqueeze(1).to(device)
-            x0 = dips_sample(model, schedule, s_t, cs_t, shape=s_t.shape, device=device,
-                             S=args.steps, t_last=args.t_last, r=args.r, eta=args.eta)
-            x0 = x0[:, 0].detach().cpu().numpy()
+            cb = np.stack([cond[:, y:y + tile, x:x + tile] for (y, x) in chunk])  # [b,3,tile,tile]
+            ct = torch.from_numpy(cb).float().to(device)
+            r0 = dips_sample(model, schedule, ct, shape=(len(chunk), 1, tile, tile),
+                             device=device, S=args.steps, t_last=args.t_last, r=args.r, eta=args.eta)
+            r0 = denormalize_r(r0[:, 0].cpu().numpy())
             for j, (y, x) in enumerate(chunk):
-                accum[y:y + tile, x:x + tile] += x0[j] * hann
-                wsum[y:y + tile, x:x + tile]  += hann
+                accum[y:y + tile, x:x + tile] += r0[j] * hann
+                wsum[y:y + tile, x:x + tile] += hann
         wsum = np.where(wsum == 0, 1.0, wsum)
         return (accum / wsum).astype(np.float32)
 
-    # ─────────────────────────────────────────────────────────────────
-    def _load_model(self, cfg, ckpt_path: str, device: str, input_resolution: int) -> UNet:
+    def _load_model(self, cfg, ckpt_path, device, input_resolution):
         m = cfg.model
-        model = UNet(
-            in_ch=m.in_ch, out_ch=m.out_ch, base_ch=m.base_ch,
-            ch_mults=tuple(m.ch_mults), num_res_blocks=m.num_res_blocks,
-            attn_resolutions=tuple(m.attn_resolutions), use_mcam=m.use_mcam,
-            input_resolution=input_resolution,
-        ).to(device)
+        model = UNet(in_ch=m.in_ch, out_ch=m.out_ch, base_ch=m.base_ch,
+                     ch_mults=tuple(m.ch_mults), num_res_blocks=m.num_res_blocks,
+                     attn_resolutions=tuple(m.attn_resolutions), use_mcam=m.use_mcam,
+                     input_resolution=input_resolution).to(device)
         ck = torch.load(ckpt_path, map_location=device)
-        state = ck["model"] if isinstance(ck, dict) and "model" in ck else ck
-        model.load_state_dict(state)
+        model.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
         model.eval()
         return model
 
@@ -152,72 +122,36 @@ class InferPipeline:
             args = self.build_parser().parse_args()
         if args.seed is not None:
             torch.manual_seed(args.seed)
-
         cfg = load_config(args.config)
         device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
-
-        # ── load s, build cs (norm 도메인 [H, W] numpy) ───────────────
         shape = tuple(args.img_shape) if args.img_shape else None
-        s_lin = self._load_img(args.s, shape)
-        s_norm = normalize_image(to_log10(s_lin), pol=args.pol).astype(np.float32)
-        H, W = s_norm.shape
-        if args.cs is not None and args.cs_raw is not None:
-            raise ValueError("--cs 와 --cs_raw 는 함께 쓸 수 없습니다 (전자는 정규화 완료, 후자는 linear)")
 
-        # cs 는 **저해상 그대로** 유지(upsample 없음). 모델 cs_enc 가 bottleneck 으로
-        # resize 하고, 타일링은 cs 를 비율에 맞춰 잘라 넣는다(_sample_tiled).
-        if args.cs is not None:
-            # 이미 정규화된 [0,1] cs (저해상 32x32 / full-res 모두 허용). 그대로 사용.
-            cs_norm = self._load_img(args.cs, shape).astype(np.float32)
-            self.logger.info(f"cs (정규화 완료) shape={cs_norm.shape} 그대로 사용")
-        elif args.cs_raw is not None:
-            # linear ratio → cs 변환. s=1 로 두면 ratio 그대로 사용됨.
-            ratio_lin = self._load_img(args.cs_raw, shape).astype(np.float32)
-            if ratio_lin.shape != s_norm.shape:
-                raise ValueError(f"s shape {s_norm.shape} != cs_raw shape {ratio_lin.shape}")
-            if args.cs_mode == "denoiser":
-                # legacy: 학습된 i2i ratio 모델로 denoise (cs_mode=denoiser 로 빌드한 데이터용, full-res)
-                if not args.ratio_ckpt:
-                    raise ValueError("--cs_mode denoiser 에는 --ratio_ckpt 가 필요합니다")
-                from nstsr.model.ratio_denoiser import build_ratio_denoiser
-                rd = build_ratio_denoiser(arch="i2i_unetsar", ckpt_path=args.ratio_ckpt,
-                                          device=device, base_ch=args.ratio_base_ch)
-                cs_norm = build_ratio_cs_patched_numpy(
-                    ratio_lin, np.ones_like(ratio_lin), ratio_denoiser=rd,
-                    patch_size=512, stride=256, pol=args.pol, device=device,
-                )
-                self.logger.info("cs_raw → normalize_ratio + i2i denoise (legacy, full-res)")
-            else:
-                # multilook (기본, 학습 데이터와 동일): looks×looks 평균 + ml-norm → 저해상 그대로.
-                cs_norm = build_ratio_cs_multilook_numpy(
-                    ratio_lin, np.ones_like(ratio_lin), looks=args.looks, pol=args.pol)
-                self.logger.info(f"cs_raw → multilook(looks={args.looks}) + ml-norm → 저해상 {cs_norm.shape} (학습 cs 와 동일)")
-        else:
-            # 무변화: 저해상 상수 0.5 (looks 비율). 모델/타일링이 resize/slice.
-            cs_norm = np.full((max(1, H // args.looks), max(1, W // args.looks)), 0.5, dtype=np.float32)
-            self.logger.info(f"cs not provided — 저해상 상수 0.5 {cs_norm.shape} (무변화)")
+        # ── conditioning 영상 로드 → cond [3, H, W] ───────────────────
+        mu = self._load_img(args.mu, shape)
+        H, W = mu.shape
+        valid = ((self._load_img(args.shadow, shape) > 0.5) if args.shadow else np.ones((H, W))).astype(np.float32)
+        da = self._load_img(args.da, shape) if args.da else np.ones((H, W), np.float32)
+        mu_n = normalize_mu_intensity(mu).astype(np.float32)
+        da_n = normalize_da(da).astype(np.float32)
+        cond = np.stack([mu_n, da_n, valid]).astype(np.float32)   # [3, H, W]
+        self.logger.info(f"cond: μ{mu.shape} D_A{'(const1)' if not args.da else ''} "
+                         f"valid{'(all)' if not args.shadow else ''}  shape={cond.shape}")
 
-        # ── model (input_resolution = 타일 크기 = 학습 패치) ───────────
         tile = int(args.tile) if args.tile else int(cfg.data.patch_size)
         tile = min(tile, H, W)
+        stride = int(args.tile_stride) if args.tile_stride else max(1, tile // 2)
         model = self._load_model(cfg, args.ckpt, device, input_resolution=tile)
-        schedule = make_linear_schedule(
-            T=cfg.diffusion.T, beta_start=cfg.diffusion.beta_start,
-            beta_end=cfg.diffusion.beta_end, device=device,
-        )
+        schedule = make_linear_schedule(T=cfg.diffusion.T, beta_start=cfg.diffusion.beta_start,
+                                        beta_end=cfg.diffusion.beta_end, device=device)
 
-        # ── sample: 영상이 타일보다 크면 overlap-tile, 아니면 통째로 ──
-        if H <= tile and W <= tile:
-            self.logger.info(f"whole-image sampling: shape=({H},{W}) steps={args.steps}")
-            x0_norm = self._sample_whole(model, schedule, s_norm, cs_norm, device, args)
-        else:
-            stride = int(args.tile_stride) if args.tile_stride else max(1, tile // 2)
-            self.logger.info(f"tiled sampling: ({H},{W}) tile={tile} stride={stride} "
-                             f"batch={args.tile_batch} steps={args.steps}")
-            x0_norm = self._sample_tiled(model, schedule, s_norm, cs_norm, device,
-                                         tile, stride, args.tile_batch, args)
+        self.logger.info(f"sampling: ({H},{W}) tile={tile} stride={stride} "
+                         f"steps={args.steps} eta={args.eta}")
+        r_hat = self._sample_r(model, schedule, cond, device, tile, stride, args.tile_batch, args)
 
-        # ── log-norm → linear ─────────────────────────────────────────
-        y_lin = np.clip(from_log10(denormalize_image(x0_norm, pol=args.pol)), 0.0, None)
+        # ── 복원: ŷ = μ · 10**r̂, shadow/no-data → 0 ──────────────────
+        y_lin = (mu * np.power(10.0, r_hat)).astype(np.float32)
+        y_lin[valid < 0.5] = 0.0
+        y_lin[mu <= 0] = 0.0
         self._save_img(args.out, y_lin)
-        self.logger.info(f"saved: {args.out}  shape={y_lin.shape}  mean={y_lin.mean():.4g}  std={y_lin.std():.4g}")
+        self.logger.info(f"saved: {args.out}  shape={y_lin.shape}  "
+                         f"mean={y_lin[y_lin>0].mean():.4g}  std={y_lin[y_lin>0].std():.4g}")

@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from nstsr.config.config import exp_dir, load_config
-from nstsr.data.dataset import SARTripletDataset
+from nstsr.data.dataset import SARSpeckleDataset
 from nstsr.diffusion.schedule import make_linear_schedule
 from nstsr.diffusion.trainer import training_step
 from nstsr.diffusion.sampler import sample as dips_sample
@@ -118,19 +118,14 @@ class TrainPipeline:
         self.logger.info(f"device = {device}"
                          + (f"  +DataParallel{gpu_ids}" if multi_gpu else ""))
 
-        # ── dataset ───────────────────────────────────────────────────
-        ratio_model = None
-        if cfg.data.mode == "online_cs":
-            ratio_model = build_ratio_denoiser(arch=args.ratio_arch, ckpt_path=args.ratio_ckpt, device=device)
-        train_ds = SARTripletDataset(
-            root=cfg.data.root, split="train", pol=cfg.pol,
-            patch_size=cfg.data.patch_size, mode=cfg.data.mode,
-            ratio_denoiser=ratio_model, augment=cfg.data.augment,
+        # ── dataset (renoise speckle) ─────────────────────────────────
+        train_ds = SARSpeckleDataset(
+            root=cfg.data.root, split="train",
+            patch_size=cfg.data.patch_size, augment=cfg.data.augment,
         )
-        val_ds = SARTripletDataset(
-            root=cfg.data.root, split="val", pol=cfg.pol,
-            patch_size=cfg.data.patch_size, mode=cfg.data.mode,
-            ratio_denoiser=ratio_model, augment=False,
+        val_ds = SARSpeckleDataset(
+            root=cfg.data.root, split="val",
+            patch_size=cfg.data.patch_size, augment=False,
         )
         train_loader = DataLoader(
             train_ds, batch_size=cfg.data.batch_size, shuffle=True,
@@ -242,46 +237,33 @@ class TrainPipeline:
         eval_model.eval()
 
         batch = next(iter(val_loader))
-        s  = batch["s"].to(device)
-        cs = batch["cs"].to(device)
-        x0_norm = dips_sample(
-            eval_model, schedule, s, cs,
-            shape=s.shape, device=device,
+        cond = batch["cond"].to(device)
+        r_hat = dips_sample(
+            eval_model, schedule, cond,
+            shape=(cond.shape[0], 1, cond.shape[2], cond.shape[3]), device=device,
             S=cfg.sampling.steps, t_last=cfg.sampling.t_last,
             r=cfg.sampling.r, eta=cfg.sampling.eta,
         )
-        # 시각화 stretch — 학습용 norm 은 극단값까지 담느라 널널해서 그냥 보면 대비가 약함.
-        # 시각화 전용으로 percentile stretch 를 한 번 더 건다.
-        #  · clean(s) 의 분포로 vmin/vmax 를 잡아 s·y·sample(=noise-free + noisy) 에 "동일" 적용
-        #    → 같은 스케일이라 노이즈 유무를 직접 비교 가능.
-        #  · cs(ratio) 는 의미가 다르므로 자체 stretch.
-        def _stretch(t, lo=1.0, hi=99.0, widen=0.6):
-            # percentile 로 범위를 잡되, widen 만큼 양쪽으로 더 넓혀 대비를 완화한다.
-            # (clean s 의 분포가 좁아 그대로 쓰면 흑백 saturate 가 심함 → 범위 확장)
+
+        def _stretch(t, lo=1.0, hi=99.0):
             a = t.detach().cpu().numpy() if hasattr(t, "detach") else np.asarray(t)
             vmn, vmx = np.percentile(a, [lo, hi])
-            if vmx <= vmn:
-                vmx = vmn + 1e-6
-            m = (vmx - vmn) * widen
-            return float(vmn - m), float(vmx + m)
+            return float(vmn), float(vmx + (1e-6 if vmx <= vmn else 0.0))
 
-        s_img, y_img, cs_img = batch["s"][0], batch["y"][0], batch["cs"][0]
-        samp = x0_norm[0].cpu()
-        v_int = _stretch(s_img)        # clean 기준 공유 stretch (noise-free + noisy 동일)
-        v_cs  = _stretch(cs_img)
+        mu_n = cond[0, 0:1].cpu()        # 구조(μ_norm)
+        r_gt = batch["r"][0].cpu()       # target speckle r
+        r_s  = r_hat[0].cpu()            # 생성 speckle r̂
+        v_mu = _stretch(mu_n); v_r = (-1.0, 1.0)   # r 은 [-1,1] 공통 스케일
         save_grid_png(
             out_dir / "val" / f"step_{step:07d}.png",
-            [s_img, y_img, cs_img, samp],
-            titles=[f"s (clean)\nstretch[{v_int[0]:.2f},{v_int[1]:.2f}]",
-                    "y (gt noisy)", f"cs (ratio)\n[{v_cs[0]:.2f},{v_cs[1]:.2f}]", "sample"],
-            vranges=[v_int, v_int, v_cs, v_int],   # s·y·sample 동일 / cs 별도
+            [mu_n, r_gt, r_s],
+            titles=["μ (structure)", "r gt (speckle)", "r̂ (sampled speckle)"],
+            vranges=[v_mu, v_r, v_r],
         )
-        # linear domain mean / std 도 함께 로깅
-        y_log_pred = denormalize_image(x0_norm.cpu().numpy(), pol=cfg.pol)
-        y_lin_pred = np.power(10.0, y_log_pred)
-        tb.add_scalar("val/pred_mean_linear", float(y_lin_pred.mean()), step)
-        tb.add_scalar("val/pred_std_linear",  float(y_lin_pred.std()), step)
-        self.logger.info(f"  val @ step {step}: pred mean={y_lin_pred.mean():.4g} std={y_lin_pred.std():.4g}")
+        # speckle 통계 비교 (생성 r̂ std 가 gt r std 를 따라가야 함)
+        tb.add_scalar("val/r_gt_std",  float(r_gt.std()),  step)
+        tb.add_scalar("val/r_hat_std", float(r_s.std()),   step)
+        self.logger.info(f"  val @ step {step}: r_gt std={r_gt.std():.4f}  r_hat std={r_s.std():.4f}")
 
     # ─────────────────────────────────────────────────────────────────
     @torch.no_grad()
@@ -297,16 +279,17 @@ class TrainPipeline:
         for i, batch in enumerate(val_loader):
             if i >= max_batches:
                 break
-            y  = batch["y"].to(device)
-            s  = batch["s"].to(device)
-            cs = batch["cs"].to(device)
-            B = y.size(0)
+            r     = batch["r"].to(device)
+            cond  = batch["cond"].to(device)
+            cmask = batch["cmask"].to(device)
+            B = r.size(0)
             t   = torch.randint(0, schedule.T, (B,), generator=g).to(device)
-            eps = torch.randn(y.shape, generator=g).to(device)
+            eps = torch.randn(r.shape, generator=g).to(device)
             sqrt_ab   = schedule.sqrt_alpha_bar[t].view(-1, 1, 1, 1)
             sqrt_1_ab = schedule.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1, 1)
-            x_t = sqrt_ab * y + sqrt_1_ab * eps
-            total += F.mse_loss(model(x_t, t, s, cs), eps).item()
+            x_t = sqrt_ab * r + sqrt_1_ab * eps
+            se = (model(x_t, t, cond) - eps) ** 2 * cmask
+            total += (se.sum() / cmask.sum().clamp_min(1.0)).item()
             n += 1
         if was_training:
             model.train()

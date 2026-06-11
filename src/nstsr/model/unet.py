@@ -129,13 +129,13 @@ class UNet(nn.Module):
 
     def __init__(
         self,
-        in_ch: int = 1,
+        in_ch: int = 4,        # 1(noised r) + 3 conditioning(μ, D_A, shadow) concat
         out_ch: int = 1,
         base_ch: int = 64,
         ch_mults: Sequence[int] = (1, 2, 4, 8),
         num_res_blocks: int = 2,
         attn_resolutions: Sequence[int] = (16,),
-        use_mcam: bool = True,
+        use_mcam: bool = False,   # deprecated (구 s/cs MCAM 경로). 새 설계는 input concat.
         t_emb_dim: int = 128,
         t_hidden: int = 256,
         input_resolution: int = 128,
@@ -228,25 +228,19 @@ class UNet(nn.Module):
         self,
         x_t: torch.Tensor,
         t: torch.Tensor,
-        s: torch.Tensor | None = None,
-        cs: torch.Tensor | None = None,
+        cond: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        x_t : [B, 1, H, W]
-        t   : [B] long
-        s   : [B, 1, H, W] or None  (use_mcam=True 이면 필수)
-        cs  : [B, 1, H, W] or None  (use_mcam=True 이면 필수)
+        x_t  : [B, 1, H, W]      noised target r (=log10(y/μ)).
+        t    : [B] long
+        cond : [B, C, H, W]      conditioning (μ, D_A, shadow) — x_t 와 channel concat.
+               in_ch = 1 + C 와 일치해야 함 (예: μ/D_A/shadow → C=3 → in_ch=4).
         """
-        if self.use_mcam:
-            assert s is not None and cs is not None, "MCAM 활성 시 s, cs 가 필요"
-            F_s = self.mcam.encode_s(s)    # list[3] — up-path 주입 (cs 는 bottleneck 에서)
-        else:
-            F_s = [None, None, None]
-
         t_emb = self.time_emb(t)
 
-        # ── encode ───────────────────────────────────────────────────
-        h = self.in_conv(x_t)
+        # ── encode (conditioning 을 입력에서 concat) ──────────────────
+        x_in = x_t if cond is None else torch.cat([x_t, cond], dim=1)
+        h = self.in_conv(x_in)
         skips: List[torch.Tensor] = [h]
         for block in self.down_blocks:
             if isinstance(block, ResBlock):
@@ -260,10 +254,7 @@ class UNet(nn.Module):
             else:
                 raise RuntimeError(f"unexpected block {type(block)}")
 
-        # ── middle (cs 를 bottleneck 해상도로 resize 해 concat 주입) ─────
-        if self.use_mcam:
-            cs_feat = self.mcam.encode_cs(cs, h.shape[-2:])  # [B, cs_ch, *bottleneck]
-            h = torch.cat([h, cs_feat], dim=1)
+        # ── middle ───────────────────────────────────────────────────
         h = self.mid_block1(h, t_emb)
         h = self.mid_attn(h) if not isinstance(self.mid_attn, nn.Identity) else h
         h = self.mid_block2(h, t_emb)
@@ -273,10 +264,7 @@ class UNet(nn.Module):
             kind = spec["type"]
             if kind == "res":
                 skip = skips.pop()
-                cond_extra = []
-                if spec["mcam_c"] > 0:
-                    cond_extra = [F_s[spec["level"]]]
-                h_in = torch.cat([h, skip] + cond_extra, dim=1)
+                h_in = torch.cat([h, skip], dim=1)
                 h = block(h_in, t_emb)
             elif kind == "attn":
                 h = block(h)

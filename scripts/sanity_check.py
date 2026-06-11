@@ -1,12 +1,13 @@
 """
-SAR-RNSD 구현 sanity check (스펙 §6). CPU 에서 실행 가능.
+renoise speckle 설계 sanity check. CPU 에서 실행 가능, 데이터/GPU 불필요.
 
     python scripts/sanity_check.py
 
-데이터/ GPU 없이 모델·정규화·diffusion·ratio denoiser 연결을 검증한다.
+정규화(r/μ/D_A) · 모델(in_ch=4 concat) · masked diffusion · 샘플러 · (있으면) dataset 검증.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -16,23 +17,13 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from nstsr.config.norm_config import (
-    normalize_image, denormalize_image, normalize_ratio,
+    normalize_r, denormalize_r, normalize_mu_intensity, normalize_da, NORM_SPECKLE,
 )
 from nstsr.data.transforms import to_log10, from_log10
-from nstsr.data.ratio_builder import build_ratio_cs
 from nstsr.model.unet import UNet
-from nstsr.model.ratio_denoiser import build_ratio_denoiser
 from nstsr.diffusion.schedule import make_linear_schedule
 from nstsr.diffusion.trainer import training_step
-
-# filtering I2I ratio 체크포인트. 다른 머신에선 환경변수로 지정:
-#   RATIO_CKPT=/path/to/best_model.pth python scripts/sanity_check.py
-# 없으면 ratio-denoiser 섹션만 건너뛰고 나머지 검사는 그대로 수행.
-import os
-RATIO_CKPT = os.environ.get(
-    "RATIO_CKPT",
-    "/media/sdb8TB/naraspace/nst-sar-filtering/checkpoints/i2i_ratio_C11_ft/best_model.pth",
-)
+from nstsr.diffusion.sampler import sample as dips_sample
 
 DEV = torch.device("cpu")
 PASS, FAIL = "✅", "❌"
@@ -40,78 +31,80 @@ results = []
 
 
 def check(name, cond, detail=""):
-    results.append(cond)
+    results.append(bool(cond))
     print(f"  {PASS if cond else FAIL} {name}" + (f"  — {detail}" if detail else ""))
 
 
-print("=== §6.1 데이터 파이프라인 ===")
+print("=== 정규화 (r / μ / D_A) ===")
 x = np.array([0.0, 1e-3, 1.0, 100.0], dtype=np.float32)
-lg = to_log10(x)
-check("to_log10(0) NaN/inf 없음", np.isfinite(lg).all(), f"log10(0)->{lg[0]:.3f}")
-rt = from_log10(to_log10(x))
-check("log10 왕복 오차<1e-3", np.allclose(rt[1:], x[1:], rtol=1e-3), f"max err {np.abs(rt[1:]-x[1:]).max():.2e}")
+check("to_log10(0) 유한", np.isfinite(to_log10(x)).all(), f"log10(0)->{to_log10(x)[0]:.3f}")
 
-xl = np.linspace(-12, 10, 50).astype(np.float32)
-back = denormalize_image(normalize_image(xl, pol="vv"), pol="vv")
-check("image norm↔denorm 왕복 |오차|<1e-5", np.abs(back - xl).max() < 1e-5, f"max {np.abs(back-xl).max():.2e}")
+L = NORM_SPECKLE["r_absmax"]
+r = np.array([-L, -0.5, 0.0, 0.5, L], dtype=np.float32)
+back = denormalize_r(normalize_r(r))
+check("r norm↔denorm 왕복 |오차|<1e-5", np.abs(back - r).max() < 1e-5, f"max {np.abs(back-r).max():.2e}")
+check("normalize_r(0)==0 (무변동)", abs(float(normalize_r(np.array([0.0], np.float32))[0])) < 1e-6)
+check("normalize_r clip ∈ [-1,1]", float(normalize_r(np.array([10.0], np.float32))[0]) == 1.0)
+mun = normalize_mu_intensity(np.array([1e-4, 1.0, 1e3], np.float32))
+check("normalize_mu ∈ [0,1]", mun.min() >= 0 and mun.max() <= 1.0, f"[{mun.min():.2f},{mun.max():.2f}]")
+dan = normalize_da(np.array([0.1, 1.0, 1000.0], np.float32))
+check("normalize_da ∈ [0,1]", dan.min() >= 0 and dan.max() <= 1.0, f"[{dan.min():.2f},{dan.max():.2f}]")
 
-nr = normalize_ratio(np.array([0.0], dtype=np.float32), pol="vv")  # log10(1.0)=0
-check("normalize_ratio(log10 1.0)==0.5", abs(float(nr[0]) - 0.5) < 1e-6, f"={float(nr[0]):.6f}")
 
-
-print("\n=== §6.2 모델 ===")
+print("\n=== 모델 (UNet in_ch=4, input-concat) ===")
 B, P = 2, 64
 xt = torch.randn(B, 1, P, P)
-s  = torch.rand(B, 1, P, P)
-cs = torch.rand(B, 1, P, P)
-t  = torch.randint(0, 1000, (B,))
-net = UNet(in_ch=1, out_ch=1, base_ch=32, ch_mults=(1, 2, 4, 8),
-           num_res_blocks=2, attn_resolutions=(16,), use_mcam=True, input_resolution=P).to(DEV)
+cond = torch.rand(B, 3, P, P)            # μ, D_A, shadow
+t = torch.randint(0, 1000, (B,))
+net = UNet(in_ch=4, out_ch=1, base_ch=32, ch_mults=(1, 2, 4, 8),
+           num_res_blocks=2, attn_resolutions=(16,), use_mcam=False, input_resolution=P).to(DEV)
 net.eval()
 with torch.no_grad():
-    out = net(xt, t, s, cs)
-check("UNet forward 출력 shape == 입력", tuple(out.shape) == (B, 1, P, P), f"{tuple(out.shape)}")
-check("MCAM enc_s, enc_cs 가중치 비공유", id(net.mcam.enc_s) != id(net.mcam.enc_cs))
+    out = net(xt, t, cond)
+check("forward 출력 shape == (B,1,P,P)", tuple(out.shape) == (B, 1, P, P), f"{tuple(out.shape)}")
 with torch.no_grad():
-    o_t1 = net(xt, torch.zeros_like(t), s, cs)
-    o_t2 = net(xt, torch.full_like(t, 999), s, cs)
-check("t 바꾸면 출력 달라짐", not torch.allclose(o_t1, o_t2, atol=1e-5),
-      f"mean|Δ|={ (o_t1-o_t2).abs().mean():.2e}")
+    o1 = net(xt, torch.zeros_like(t), cond)
+    o2 = net(xt, torch.full_like(t, 999), cond)
+check("t 바꾸면 출력 달라짐", not torch.allclose(o1, o2, atol=1e-5), f"mean|Δ|={(o1-o2).abs().mean():.2e}")
 with torch.no_grad():
-    o_cs1 = net(xt, t, s, torch.zeros_like(cs))
-    o_cs2 = net(xt, t, s, torch.ones_like(cs))
-check("cs 바꾸면 출력 달라짐 (조건부 검증)", not torch.allclose(o_cs1, o_cs2, atol=1e-5),
-      f"mean|Δ|={ (o_cs1-o_cs2).abs().mean():.2e}")
+    c1 = net(xt, t, torch.zeros_like(cond))
+    c2 = net(xt, t, torch.ones_like(cond))
+check("cond 바꾸면 출력 달라짐", not torch.allclose(c1, c2, atol=1e-5), f"mean|Δ|={(c1-c2).abs().mean():.2e}")
 
 
-print("\n=== §6.3 diffusion / 학습 1-step ===")
+print("\n=== diffusion (masked) / 학습 1-step ===")
 sched = make_linear_schedule(T=1000, beta_start=1e-4, beta_end=2e-2, device=DEV)
 net.train()
-batch = {"y": torch.rand(B, 1, P, P), "s": s, "cs": cs}
+cmask = (torch.rand(B, 1, P, P) > 0.1).float()         # ~90% valid
+batch = {"r": torch.rand(B, 1, P, P) * 2 - 1, "cond": cond, "cmask": cmask}
 loss = training_step(batch, net, sched, device=DEV)
 loss.backward()
 g = sum(p.grad.abs().sum() for p in net.parameters() if p.grad is not None)
-check("training_step loss 유한", torch.isfinite(loss).item(), f"loss={loss.item():.4f}")
-check("backward 후 gradient 흐름", float(g) > 0, f"Σ|grad|={float(g):.3e}")
+check("masked training_step loss 유한", torch.isfinite(loss).item(), f"loss={loss.item():.4f}")
+check("backward gradient 흐름", float(g) > 0, f"Σ|grad|={float(g):.3e}")
+# cmask=0 이면 loss 0 (마스킹 동작)
+batch0 = {"r": batch["r"], "cond": cond, "cmask": torch.zeros_like(cmask)}
+check("cmask=0 → loss 0 (마스킹)", float(training_step(batch0, net, sched, DEV)) == 0.0)
+
+print("\n=== 샘플러 (cond → r̂) ===")
+net.eval()
+with torch.no_grad():
+    rh = dips_sample(net, sched, cond, shape=(B, 1, P, P), device=DEV, S=6, t_last=1, eta=1.0)
+check("sample 출력 shape", tuple(rh.shape) == (B, 1, P, P), f"{tuple(rh.shape)}")
+check("sample 유한", torch.isfinite(rh).all().item())
 
 
-print("\n=== ratio denoiser 연결 (i2i_unetsar, 실제 체크포인트) ===")
-if not Path(RATIO_CKPT).exists():
-    print(f"  ⏭️  ratio ckpt 없음 → 이 섹션 건너뜀 (훈련엔 불필요; prepare 때만 필요)")
-    print(f"      필요시: RATIO_CKPT=/path/best_model.pth 로 지정  (현재: {RATIO_CKPT})")
+print("\n=== dataset (있으면) ===")
+DS = os.environ.get("SPECKLE_DS", "/media/sdb8TB/sentinel1/korea/speckle_ds")
+if (Path(DS) / "splits" / "train.txt").exists():
+    from nstsr.data.dataset import SARSpeckleDataset
+    ds = SARSpeckleDataset(DS, "train", patch_size=128, augment=True)
+    b = ds[0]
+    check("dataset r/cond/cmask shape", b["r"].shape == (1, 128, 128) and b["cond"].shape == (3, 128, 128))
+    check("dataset r ∈ [-1,1]", float(b["r"].min()) >= -1.001 and float(b["r"].max()) <= 1.001,
+          f"[{float(b['r'].min()):.2f},{float(b['r'].max()):.2f}]")
 else:
-    rd = build_ratio_denoiser(arch="i2i_unetsar", ckpt_path=RATIO_CKPT, device="cpu", base_ch=32)
-    check("ratio denoiser eval 모드", not rd.training)
-    check("ratio denoiser 전부 freeze", all(not p.requires_grad for p in rd.parameters()))
-    # cs 빌더 end-to-end: 작은 linear y,s -> cs
-    y_lin = torch.rand(1, 1, 256, 256) * 5 + 0.1
-    s_lin = torch.rand(1, 1, 256, 256) * 5 + 0.1
-    with torch.no_grad():
-        cs_out = build_ratio_cs(y_lin, s_lin, ratio_denoiser=rd, pol="vv")
-    check("build_ratio_cs 출력 shape", tuple(cs_out.shape) == (1, 1, 256, 256), f"{tuple(cs_out.shape)}")
-    check("cs 출력 유한 & 대략 [0,1]", torch.isfinite(cs_out).all().item() and
-          float(cs_out.min()) > -0.5 and float(cs_out.max()) < 1.5,
-          f"[{float(cs_out.min()):.3f}, {float(cs_out.max()):.3f}]")
+    print(f"  ⏭️  speckle_ds 없음 → 건너뜀 ({DS})")
 
 
 print(f"\n{'='*50}")

@@ -33,19 +33,25 @@ def diffuse(x0: torch.Tensor, t: torch.Tensor, schedule: DDPMSchedule, noise: to
 
 def training_step(batch, model, schedule: DDPMSchedule, device: str = "cuda") -> torch.Tensor:
     """
-    한 batch loss 반환.
+    한 batch masked ε-MSE loss 반환 (renoise speckle 설계).
 
-    batch : dict with keys y, s, cs — 모두 [B, 1, H, W], log-normalized [0, 1].
-    model : conditional UNet (forward(x_t, t, s, cs)).
+    batch : dict with
+        r     : [B, 1, H, W]  normalized target r = norm(log10(y/μ))  (= x0).
+        cond  : [B, C, H, W]  conditioning (μ, D_A, shadow) concat.
+        cmask : [B, 1, H, W]  loss mask ∈ {0,1} (shadow/change/no-data 제외).
+    model : conditional UNet (forward(x_t, t, cond)).
+
+    shadow·change·no-data 픽셀은 cmask=0 으로 loss 에서 제외 (유효 speckle 타깃이 없음).
     """
-    y  = batch["y"].to(device, non_blocking=True)
-    s  = batch["s"].to(device, non_blocking=True)
-    cs = batch["cs"].to(device, non_blocking=True)
+    r     = batch["r"].to(device, non_blocking=True)
+    cond  = batch["cond"].to(device, non_blocking=True)
+    cmask = batch["cmask"].to(device, non_blocking=True)
 
-    B = y.size(0)
+    B = r.size(0)
     t = torch.randint(0, schedule.T, (B,), device=device)
-    x_t, eps = diffuse(y, t, schedule)
+    x_t, eps = diffuse(r, t, schedule)
 
-    eps_hat = model(x_t, t, s, cs)
-    loss = F.mse_loss(eps_hat, eps)
+    eps_hat = model(x_t, t, cond)
+    se = (eps_hat - eps) ** 2 * cmask          # per-pixel masked squared error
+    loss = se.sum() / cmask.sum().clamp_min(1.0)
     return loss

@@ -3,22 +3,21 @@ seed: 42
 pol: vv
 
 data:
-  root: ./data_root            # prepare 파이프라인 결과 경로
+  root: /media/sdb8TB/sentinel1/korea/speckle_ds   # build_speckle_ds.py 결과
   patch_size: 128
   batch_size: 16
   num_workers: 4
   augment: true
-  mode: cache_cs               # cache_cs | online_cs
 
 model:
   base_ch: 64
   ch_mults: [1, 2, 4, 8]
   num_res_blocks: 2
   attn_resolutions: [16]
-  in_ch: 1
+  in_ch: 4                     # 1(noised r) + 3 cond(μ, D_A, shadow) concat
   out_ch: 1
-  use_mcam: true
-  use_tccam: false             # 현 단계 비활성, 추후 편파 확장 시 true
+  use_mcam: false              # 구 s/cs MCAM 폐기, 새 설계는 input concat
+  use_tccam: false
 
 diffusion:
   T: 1000
